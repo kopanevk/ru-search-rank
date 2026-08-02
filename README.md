@@ -84,3 +84,39 @@ qrels означает лишь отсутствие суждения.
 Следующий gate — воспроизвести официальный Russian MIRACL BM25 на полном готовом
 индексе, проверить nDCG@10 и Recall@100, затем сохранить детерминированный
 top-100 candidate cache.
+
+## Phase 2: zero-shot reranking
+
+Phase 1 теперь завершена внешним Colab-прогоном; её BM25-раны и candidate cache
+служат неизменяемым входом для Phase 2. Реализован zero-shot cross-encoder
+`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` на pinned revision
+`1427fd652930e4ba29e8149678df786c240d8825`. Полный inference выполняется только
+на Colab GPU через `scripts/run_zeroshot_rerank.ipynb`; локальные тесты используют
+инъецируемый детерминированный scorer и не скачивают модель.
+
+Основной порядок команд:
+
+```bash
+python -m rusearchrank.cli preflight --stage rerank --config configs/rerank.yaml
+python -m rusearchrank.cli smoke-rerank --config configs/rerank.yaml --limit 64
+python -m rusearchrank.cli rerank-score --config configs/rerank.yaml --split dev
+python -m rusearchrank.cli build-rerank-run --config configs/rerank.yaml --split dev --depth 100
+python -m rusearchrank.cli build-rerank-run --config configs/rerank.yaml --split dev --depth 10
+python -m rusearchrank.cli build-rerank-run --config configs/rerank.yaml --split dev --depth 20
+python -m rusearchrank.cli build-rerank-run --config configs/rerank.yaml --split dev --depth 50
+python -m rusearchrank.cli evaluate-rerank --config configs/rerank.yaml --split dev
+python -m rusearchrank.cli package-phase2 --config configs/rerank.yaml
+```
+
+`rerank-score` заблокирован на уровне CLI до успешного real-model smoke с
+совпадающими config/source/input/model fingerprints. Скоринг возобновляется по
+query-shards; несовместимые шарды сохраняются как `*.stale.<UTC>`. Сырые logits
+хранятся без округления в float32 Parquet, а TREC-файл получает отдельный
+строго убывающий score `1000000 - rank`, поэтому tie-break `trec_eval` не может
+изменить порядок.
+
+Официальная метрика Phase 2 — только standard nDCG@10 из NIST `trec_eval`
+v9.0.8. Recall@100, MRR@10, condensed nDCG, paired bootstrap, sparse-judgment
+диагностика и depth profile K=10/20/50 являются диагностическими. Финальный ZIP
+содержит score Parquet, официальный K=100 run, четыре metrics JSON, byte-exact
+snapshot протокола и non-self-referential manifest.

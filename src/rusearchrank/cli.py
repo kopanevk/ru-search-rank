@@ -54,10 +54,17 @@ from .data import (
     validate_queries,
 )
 from .evaluation import (
+    assert_candidate_set_invariant,
     build_qrels_split_audit,
+    evaluate_bm25_metrics,
+    paired_ranking_comparison,
     parse_trec_eval_metric,
+    parse_trec_eval_per_query,
     reproduction_rows,
+    sparse_judgment_diagnostics,
+    stratified_delta_summary,
 )
+from . import rerank as rerank_module
 from .retrieval import (
     build_retrieval_depth_audit,
     join_qrels,
@@ -1203,6 +1210,13 @@ def _preflight_candidate_cache(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _preflight_command(args: argparse.Namespace) -> int:
+    if args.stage == "rerank":
+        if args.check_index:
+            raise ValueError("--check-index is only valid for retrieval preflight")
+        rerank_config = rerank_module.load_rerank_config(args.config)
+        report = rerank_module.preflight_rerank(rerank_config)
+        _print_json({"status": "PASS", "preflight": report})
+        return 0
     config = _load_retrieval_config(args.config)
     if args.stage == "retrieval":
         report = _preflight_retrieval(config, check_index=args.check_index)
@@ -3135,10 +3149,611 @@ def _package_phase1(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rerank_file_metadata(
+    config: dict[str, Any], path: Path
+) -> dict[str, Any]:
+    _require_nonempty_regular_file(path, label="Phase 2 input")
+    return {
+        "path": rerank_module.portable_path(config, path),
+        "size_bytes": path.stat().st_size,
+        "sha256": _sha256(path),
+    }
+
+
+def _execute_rerank_trec_eval(
+    config: dict[str, Any],
+    *,
+    run_path: Path,
+    executable: Path,
+    version_probe: dict[str, Any],
+) -> dict[str, Any]:
+    qrels_path = rerank_module.resolve_path(config, config["inputs"]["qrels"])
+    executions: dict[str, Any] = {}
+    command_specs = {
+        "ndcg_at_10": (config["evaluation"]["ndcg_command"], "ndcg_cut_10"),
+        "recall_at_100": (config["evaluation"]["recall_command"], "recall_100"),
+        "mrr_at_10": (config["evaluation"]["mrr_command"], "recip_rank"),
+        "per_query_ndcg_at_10": (
+            config["evaluation"]["per_query_command"],
+            "ndcg_cut_10",
+        ),
+    }
+    parsed: dict[str, Any] = {}
+    for name, (arguments, metric) in command_specs.items():
+        execution = _run_trec_eval_binary(
+            executable,
+            [*[str(value) for value in arguments], str(qrels_path), str(run_path)],
+        )
+        execution["executable"] = str(executable)
+        execution["expected_version"] = str(config["evaluation"]["trec_eval_version"])
+        execution["version_probe"] = version_probe
+        executions[name] = execution
+        if name == "per_query_ndcg_at_10":
+            parsed[name] = parse_trec_eval_per_query(str(execution["stdout"]), metric)
+        else:
+            parsed[name] = parse_trec_eval_metric(str(execution["stdout"]), metric)
+        execution["parsed"] = parsed[name]
+    return {
+        "executable": str(executable),
+        "expected_version": str(config["evaluation"]["trec_eval_version"]),
+        "version_probe": version_probe,
+        "run": _rerank_file_metadata(config, run_path),
+        "executions": executions,
+        "parsed": parsed,
+    }
+
+
+def _trec_python_ranking(
+    run: pd.DataFrame, *, docid_ascending: bool
+) -> pd.DataFrame:
+    ordered = run[["query_id", "docid", "bm25_score"]].copy()
+    ordered[["query_id", "docid"]] = ordered[["query_id", "docid"]].astype(
+        "string"
+    )
+    ordered["bm25_score"] = pd.to_numeric(
+        ordered["bm25_score"], errors="raise"
+    ).astype("float64")
+    ordered = ordered.sort_values(
+        ["query_id", "bm25_score", "docid"],
+        ascending=[True, False, docid_ascending],
+        kind="mergesort",
+    )
+    ordered["bm25_rank"] = (
+        ordered.groupby("query_id", sort=False).cumcount().add(1).astype("int64")
+    )
+    return ordered[["query_id", "docid", "bm25_rank"]].reset_index(drop=True)
+
+
+def _python_metric_vector(report: dict[str, Any]) -> dict[str, float]:
+    return {
+        str(row["query_id"]): float(row["ndcg_at_10"])
+        for row in report["per_query"]
+    }
+
+
+def _vector_difference(
+    left: dict[str, float], right: dict[str, float]
+) -> float:
+    if set(left) != set(right):
+        return float("inf")
+    return max(abs(float(left[key]) - float(right[key])) for key in left)
+
+
+def _raw_score_tie_count(frame: pd.DataFrame, score_column: str) -> int:
+    counts = frame.groupby(["query_id", score_column], dropna=False).size()
+    return int(sum(int(value) - 1 for value in counts if int(value) > 1))
+
+
+def _metric_common_provenance(
+    config: dict[str, Any],
+    *,
+    score_sidecar: dict[str, Any],
+    input_artifacts: dict[str, Any],
+    evaluation_fingerprint: str,
+    ties: int,
+) -> dict[str, Any]:
+    return {
+        "input_artifacts": input_artifacts,
+        "model_id": str(config["model"]["id"]),
+        "model_revision": str(config["model"]["revision"]),
+        "tokenizer_revision": str(config["model"]["tokenizer_revision"]),
+        "device": str(score_sidecar["device"]),
+        "dtype": str(score_sidecar["dtype"]),
+        "batch_size": int(score_sidecar["batch_size"]),
+        "max_length": int(config["input"]["max_length"]),
+        "raw_score_ties": int(ties),
+        "token_accounting": score_sidecar["token_accounting"],
+        "peak_rss_bytes": int(score_sidecar["peak_rss_bytes"]),
+        "implementation_version": str(config["implementation"]["version"]),
+        "score_schema_version": int(config["implementation"]["score_schema_version"]),
+        "source_tree_sha256": str(score_sidecar["source_tree_sha256"]),
+        "config_sha256": _sha256(Path(str(config["_config_path"]))),
+        "input_fingerprint": str(score_sidecar["input_fingerprint"]),
+        "evaluation_fingerprint": evaluation_fingerprint,
+        "score_encoding": rerank_module.SCORE_ENCODING,
+    }
+
+
+def _smoke_rerank(args: argparse.Namespace) -> int:
+    config = rerank_module.load_rerank_config(args.config)
+    report = rerank_module.run_smoke_rerank(
+        config,
+        limit=int(args.limit),
+        requested_device=str(args.device),
+        output=args.output,
+    )
+    _print_json(report)
+    return 0
+
+
+def _rerank_score(
+    args: argparse.Namespace,
+    *,
+    scorer: rerank_module.PairScorer | None = None,
+) -> int:
+    config = rerank_module.load_rerank_config(args.config)
+    try:
+        rerank_module.validate_smoke_gate(config)
+    except (ValueError, OSError) as exc:
+        raise StageError(
+            stage="rerank-score/smoke-gate",
+            command=(
+                "python -m rusearchrank.cli rerank-score "
+                "--config configs/rerank.yaml --split dev"
+            ),
+            inputs={
+                "smoke_report": rerank_module.portable_path(
+                    config,
+                    rerank_module.resolve_path(config, config["audits"]["smoke"]),
+                ),
+                "config": rerank_module.portable_path(
+                    config, Path(str(config["_config_path"]))
+                ),
+            },
+            outputs={
+                "scores": rerank_module.portable_path(
+                    config,
+                    rerank_module.resolve_path(
+                        config, config["artifacts"]["scores"]
+                    ),
+                )
+            },
+            root_cause=str(exc),
+            reusable="all Phase 1 inputs and compatible partial score shards remain reusable",
+            repeat_cell=(
+                "Cell 9: rerun `smoke-rerank --limit 64`; only then repeat Cell 10"
+            ),
+        ) from exc
+    report = rerank_module.run_rerank_scoring(
+        config,
+        split=str(args.split),
+        requested_device=str(args.device),
+        batch_size_override=args.batch_size,
+        overwrite=bool(args.overwrite),
+        scorer=scorer,
+    )
+    _print_json(report)
+    return 0
+
+
+def _build_rerank_run(args: argparse.Namespace) -> int:
+    config = rerank_module.load_rerank_config(args.config)
+    report = rerank_module.build_rerank_run(
+        config,
+        split=str(args.split),
+        depth=int(args.depth),
+        overwrite=bool(args.overwrite),
+    )
+    _print_json(report)
+    return 0
+
+
+def _evaluate_rerank(args: argparse.Namespace) -> int:
+    config = rerank_module.load_rerank_config(args.config)
+    if args.split != "dev":
+        raise ValueError("Phase 2 evaluation only supports dev")
+    rerank_module.validate_phase1_inputs(config)
+    score_path = rerank_module.resolve_path(config, config["artifacts"]["scores"])
+    score_sidecar_path = score_path.with_name(f"{score_path.name}.json")
+    score_sidecar = rerank_module.validate_current_score_sidecar(
+        config, score_path=score_path
+    )
+
+    official_depth = int(config["protocol"]["official_depth"])
+    depths = [
+        *[int(value) for value in config["protocol"]["diagnostic_depths"]],
+        official_depth,
+    ]
+    run_paths = {depth: rerank_module.rerank_run_path(config, depth) for depth in depths}
+    for depth, path in run_paths.items():
+        _require_nonempty_regular_file(path, label=f"rerank K={depth} run")
+    bm25_path = rerank_module.resolve_path(config, config["inputs"]["bm25_run"])
+    qrels_path = rerank_module.resolve_path(config, config["inputs"]["qrels"])
+    candidates_path = rerank_module.resolve_path(config, config["inputs"]["candidates"])
+    current_hashes = {
+        "config": _sha256(Path(str(config["_config_path"]))),
+        "source_tree": rerank_module.source_tree_sha256(config)[0],
+        "scores": _sha256(score_path),
+        "bm25_run": _sha256(bm25_path),
+        "qrels": _sha256(qrels_path),
+        "candidates": _sha256(candidates_path),
+        **{f"rerank_k{depth}": _sha256(path) for depth, path in run_paths.items()},
+    }
+    evaluation_fingerprint = rerank_module.canonical_json_sha256(current_hashes)
+    output_paths = {
+        name: rerank_module.resolve_path(config, value)
+        for name, value in config["metrics"].items()
+    }
+    existing = {name: path.exists() for name, path in output_paths.items()}
+    if all(existing.values()) and not args.overwrite:
+        reports = {name: _read_json(path) for name, path in output_paths.items()}
+        if all(
+            report.get("status") == "PASS"
+            and report.get("evaluation_fingerprint") == evaluation_fingerprint
+            for report in reports.values()
+        ):
+            _print_json(
+                {
+                    "status": "PASS",
+                    "action": "reused_valid_evaluation",
+                    "evaluation_fingerprint": evaluation_fingerprint,
+                    "outputs": {
+                        name: rerank_module.portable_path(config, path)
+                        for name, path in output_paths.items()
+                    },
+                }
+            )
+            return 0
+        raise ValueError(
+            "existing evaluation outputs are stale or invalid and were preserved; "
+            "use --overwrite after review"
+        )
+    if any(existing.values()) and not all(existing.values()) and not args.overwrite:
+        raise ValueError(
+            f"partial evaluation output detected and preserved: {existing}; "
+            "use --overwrite after review"
+        )
+    if args.overwrite:
+        for path in output_paths.values():
+            rerank_module.preserve_stale(path)
+
+    executable = rerank_module.resolve_trec_eval(config)
+    version_probe = rerank_module.probe_trec_eval(executable)
+    baseline_trec = _execute_rerank_trec_eval(
+        config,
+        run_path=bm25_path,
+        executable=executable,
+        version_probe=version_probe,
+    )
+    depth_trec = {
+        depth: _execute_rerank_trec_eval(
+            config,
+            run_path=path,
+            executable=executable,
+            version_probe=version_probe,
+        )
+        for depth, path in run_paths.items()
+    }
+
+    qrels = load_qrels(qrels_path, split="dev")
+    query_ids = list(dict.fromkeys(qrels["query_id"].astype("string").map(str)))
+    candidates = pd.read_parquet(candidates_path)
+    candidates = candidates.loc[candidates["split"].astype("string").eq("dev")].copy()
+    bm25_run = read_trec_run(str(bm25_path), split="dev")
+    candidate_invariant = assert_candidate_set_invariant(candidates, bm25_run)
+    rerank_runs = {
+        depth: read_trec_run(str(path), split="dev")
+        for depth, path in run_paths.items()
+    }
+    for depth, run in rerank_runs.items():
+        assert_candidate_set_invariant(candidates, run)
+        assert_candidate_set_invariant(bm25_run, run)
+
+    tolerance = float(config["evaluation"]["python_vs_trec_eval_tolerance"])
+    baseline_vector = baseline_trec["parsed"]["per_query_ndcg_at_10"]
+    baseline_rank_desc = _trec_python_ranking(bm25_run, docid_ascending=False)
+    baseline_rank_asc = _trec_python_ranking(bm25_run, docid_ascending=True)
+    baseline_python_desc = evaluate_bm25_metrics(
+        baseline_rank_desc, qrels, query_ids=query_ids
+    )
+    baseline_python_asc = evaluate_bm25_metrics(
+        baseline_rank_asc, qrels, query_ids=query_ids
+    )
+    desc_diff = _vector_difference(
+        _python_metric_vector(baseline_python_desc), baseline_vector
+    )
+    asc_diff = _vector_difference(
+        _python_metric_vector(baseline_python_asc), baseline_vector
+    )
+    desc_match = desc_diff <= tolerance
+    asc_match = asc_diff <= tolerance
+    if not desc_match and not asc_match:
+        raise ValueError(
+            "neither empirical BM25 docno tie-break reproduces trec_eval -q: "
+            f"desc_diff={desc_diff}, asc_diff={asc_diff}, tolerance={tolerance}"
+        )
+    baseline_ranking = baseline_rank_desc if desc_match else baseline_rank_asc
+    baseline_python = baseline_python_desc if desc_match else baseline_python_asc
+    aggregate_baseline_difference = abs(
+        float(baseline_python["aggregate"]["ndcg_at_10"])
+        - float(baseline_trec["parsed"]["ndcg_at_10"])
+    )
+    if aggregate_baseline_difference > tolerance:
+        raise ValueError("Python BM25 nDCG@10 differs from official trec_eval")
+    tie_break_audit = {
+        "empirical_method": "compare full per-query nDCG@10 vectors",
+        "docno_desc_max_abs_difference": desc_diff,
+        "docno_asc_max_abs_difference": asc_diff,
+        "docno_desc_matches": desc_match,
+        "docno_asc_matches": asc_match,
+        "conclusion": (
+            "docno_desc_selected_both_metric_equivalent"
+            if desc_match and asc_match
+            else "docno_desc"
+            if desc_match
+            else "docno_asc"
+        ),
+    }
+
+    python_by_depth: dict[int, dict[str, Any]] = {}
+    sparse_by_depth: dict[int, dict[str, Any]] = {}
+    comparison_by_depth: dict[int, dict[str, Any]] = {}
+    baseline_sparse = sparse_judgment_diagnostics(
+        candidates=candidates,
+        qrels=qrels,
+        ranking=baseline_ranking,
+        bm25_ranking=baseline_ranking,
+        query_ids=query_ids,
+    )
+    for depth, run in rerank_runs.items():
+        ranking = run.rename(columns={"source_rank": "bm25_rank"})[
+            ["query_id", "docid", "bm25_rank"]
+        ]
+        python_report = evaluate_bm25_metrics(
+            ranking, qrels, query_ids=query_ids
+        )
+        python_by_depth[depth] = python_report
+        if depth == official_depth:
+            difference = abs(
+                float(python_report["aggregate"]["ndcg_at_10"])
+                - float(depth_trec[depth]["parsed"]["ndcg_at_10"])
+            )
+            if difference > tolerance:
+                raise ValueError(
+                    f"Python reranker nDCG@10 differs from trec_eval by {difference}"
+                )
+        sparse_by_depth[depth] = sparse_judgment_diagnostics(
+            candidates=candidates,
+            qrels=qrels,
+            ranking=ranking,
+            bm25_ranking=baseline_ranking,
+            query_ids=query_ids,
+        )
+        comparison_by_depth[depth] = paired_ranking_comparison(
+            baseline_vector,
+            depth_trec[depth]["parsed"]["per_query_ndcg_at_10"],
+            resamples=int(config["evaluation"]["bootstrap_resamples"]),
+            seed=int(config["evaluation"]["bootstrap_seed"]),
+            confidence=float(config["evaluation"]["bootstrap_confidence"]),
+        )
+
+    official_trec = depth_trec[official_depth]
+    official_sparse = sparse_by_depth[official_depth]
+    official_comparison = comparison_by_depth[official_depth]
+    recall_difference = abs(
+        float(baseline_trec["parsed"]["recall_at_100"])
+        - float(official_trec["parsed"]["recall_at_100"])
+    )
+    if recall_difference > 1e-12:
+        raise ValueError(
+            "trec_eval recall.100 differs despite exact candidate-set equality"
+        )
+    sparse_inversion_delta = {
+        "queries_with_unjudged_above_relevant": int(
+            official_sparse["queries_with_unjudged_above_relevant"]
+            - baseline_sparse["queries_with_unjudged_above_relevant"]
+        ),
+        "pairwise_unjudged_relevant_inversions": int(
+            official_sparse["pairwise_unjudged_relevant_inversions"]
+            - baseline_sparse["pairwise_unjudged_relevant_inversions"]
+        ),
+    }
+    baseline_vector_python = _python_metric_vector(baseline_python)
+    system_vector = official_trec["parsed"]["per_query_ndcg_at_10"]
+    stratification = stratified_delta_summary(
+        candidates=candidates,
+        baseline_per_query=baseline_vector,
+        system_per_query=system_vector,
+        oracle_per_query=baseline_sparse["oracle_per_query"],
+    )
+    pooling_bias_suspected = bool(
+        float(official_comparison["mean_delta"]) > 0
+        and float(official_sparse["judged_at_10"])
+        < float(baseline_sparse["judged_at_10"]) - 0.05
+    )
+
+    score_table = pq.read_table(score_path, columns=["query_id", "docid", "score"])
+    raw_scores = score_table.to_pandas()
+    official_raw_ties = _raw_score_tie_count(raw_scores, "score")
+    baseline_ties = _raw_score_tie_count(bm25_run, "bm25_score")
+    input_artifacts = {
+        "scores": _rerank_file_metadata(config, score_path),
+        "candidates": _rerank_file_metadata(config, candidates_path),
+        "qrels": _rerank_file_metadata(config, qrels_path),
+        "bm25_run": _rerank_file_metadata(config, bm25_path),
+        **{
+            f"rerank_run_k{depth}": _rerank_file_metadata(config, path)
+            for depth, path in run_paths.items()
+        },
+    }
+    baseline_common = _metric_common_provenance(
+        config,
+        score_sidecar=score_sidecar,
+        input_artifacts=input_artifacts,
+        evaluation_fingerprint=evaluation_fingerprint,
+        ties=baseline_ties,
+    )
+    system_common = _metric_common_provenance(
+        config,
+        score_sidecar=score_sidecar,
+        input_artifacts=input_artifacts,
+        evaluation_fingerprint=evaluation_fingerprint,
+        ties=official_raw_ties,
+    )
+    sanity_reference = float(config["evaluation"]["expected_bm25_ndcg_at_10"])
+    sanity_difference = float(baseline_trec["parsed"]["ndcg_at_10"]) - sanity_reference
+    baseline_payload = {
+        "status": "PASS",
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "official": {
+            "metric": "standard_nDCG@10",
+            "value": float(baseline_trec["parsed"]["ndcg_at_10"]),
+            "tool": "NIST trec_eval",
+            "version": str(config["evaluation"]["trec_eval_version"]),
+        },
+        "diagnostic": {
+            "diagnostic": True,
+            "recall_at_100": float(baseline_trec["parsed"]["recall_at_100"]),
+            "mrr_at_10": float(baseline_trec["parsed"]["mrr_at_10"]),
+            "sparse_judgments": baseline_sparse,
+        },
+        "trec_eval": baseline_trec,
+        "python_cross_check": {
+            "ndcg_at_10": float(baseline_python["aggregate"]["ndcg_at_10"]),
+            "absolute_difference": aggregate_baseline_difference,
+            "tolerance": tolerance,
+            "tie_break": tie_break_audit,
+            "per_query_vector_checked": len(baseline_vector_python),
+        },
+        "phase1_sanity_reference": {
+            "expected": sanity_reference,
+            "recomputed": float(baseline_trec["parsed"]["ndcg_at_10"]),
+            "difference": sanity_difference,
+            "difference_exceeds_0_0005": abs(sanity_difference) > 0.0005,
+            "explanation_if_exceeded": (
+                "The Phase 2 baseline uses -M 100 and trec_eval score/docno "
+                "tie-breaking on the explicit top-100 run."
+                if abs(sanity_difference) > 0.0005
+                else None
+            ),
+        },
+        **baseline_common,
+    }
+    system_payload = {
+        "status": "PASS",
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "official": {
+            "metric": "standard_nDCG@10",
+            "value": float(official_trec["parsed"]["ndcg_at_10"]),
+            "tool": "NIST trec_eval",
+            "version": str(config["evaluation"]["trec_eval_version"]),
+            "depth": official_depth,
+        },
+        "diagnostic": {
+            "diagnostic": True,
+            "recall_at_100": float(official_trec["parsed"]["recall_at_100"]),
+            "mrr_at_10": float(official_trec["parsed"]["mrr_at_10"]),
+            "sparse_judgments": official_sparse,
+        },
+        "trec_eval": official_trec,
+        "python_cross_check": {
+            "ndcg_at_10": float(
+                python_by_depth[official_depth]["aggregate"]["ndcg_at_10"]
+            ),
+            "absolute_difference": abs(
+                float(python_by_depth[official_depth]["aggregate"]["ndcg_at_10"])
+                - float(official_trec["parsed"]["ndcg_at_10"])
+            ),
+            "tolerance": tolerance,
+            "tie_break_irrelevant": True,
+        },
+        **system_common,
+    }
+    comparison_payload = {
+        "status": "PASS",
+        "official_metric": "standard_nDCG@10",
+        "paired": official_comparison,
+        "recall_at_100_invariant": {
+            **candidate_invariant,
+            "trec_eval_absolute_difference": recall_difference,
+            "strict_set_equality_is_primary": True,
+        },
+        "sparse_judgment_delta": sparse_inversion_delta,
+        "stratified_mean_delta": stratification,
+        "pooling_bias_suspected": pooling_bias_suspected,
+        "condensed_ndcg_at_10": {
+            "diagnostic": True,
+            "bm25": float(baseline_sparse["condensed_ndcg_at_10"]),
+            "reranker": float(official_sparse["condensed_ndcg_at_10"]),
+            "delta": float(
+                official_sparse["condensed_ndcg_at_10"]
+                - baseline_sparse["condensed_ndcg_at_10"]
+            ),
+        },
+        **system_common,
+    }
+    depth_entries: list[dict[str, Any]] = []
+    for depth in depths:
+        sparse = sparse_by_depth[depth]
+        paired = comparison_by_depth[depth]
+        depth_entries.append(
+            {
+                "depth": depth,
+                "official": depth == official_depth,
+                "diagnostic": depth != official_depth,
+                "ndcg_at_10": float(depth_trec[depth]["parsed"]["ndcg_at_10"]),
+                "judged_at_10": float(sparse["judged_at_10"]),
+                "condensed_ndcg_at_10": float(sparse["condensed_ndcg_at_10"]),
+                "improved": int(paired["improved"]),
+                "degraded": int(paired["degraded"]),
+                "tie": int(paired["tie"]),
+                "candidate_set_invariant": True,
+                "run": _rerank_file_metadata(config, run_paths[depth]),
+                "trec_eval": depth_trec[depth],
+            }
+        )
+    depth_payload = {
+        "status": "PASS",
+        "baseline_sha256": _sha256(bm25_path),
+        "depths": depth_entries,
+        **system_common,
+    }
+    _write_json(output_paths["baseline"], baseline_payload)
+    _write_json(output_paths["system"], system_payload)
+    _write_json(output_paths["comparison"], comparison_payload)
+    _write_json(output_paths["depth_profile"], depth_payload)
+    _print_json(
+        {
+            "status": "PASS",
+            "action": "evaluated",
+            "official_ndcg_at_10": system_payload["official"]["value"],
+            "recomputed_bm25_ndcg_at_10": baseline_payload["official"]["value"],
+            "mean_delta": official_comparison["mean_delta"],
+            "pooling_bias_suspected": pooling_bias_suspected,
+            "evaluation_fingerprint": evaluation_fingerprint,
+            "outputs": {
+                name: rerank_module.portable_path(config, path)
+                for name, path in output_paths.items()
+            },
+        }
+    )
+    return 0
+
+
+def _package_phase2(args: argparse.Namespace) -> int:
+    config = rerank_module.load_rerank_config(args.config)
+    report = rerank_module.package_phase2(config, overwrite=bool(args.overwrite))
+    _print_json(report)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m rusearchrank.cli",
-        description="RuSearchRank Phase 0 checks and guarded Phase 1A retrieval",
+        description=(
+            "RuSearchRank Phase 0 checks, guarded Phase 1 retrieval, and "
+            "Phase 2 zero-shot reranking"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -3213,7 +3828,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     preflight_parser.add_argument(
         "--stage",
-        choices=("retrieval", "candidate-cache", "package"),
+        choices=("retrieval", "candidate-cache", "package", "rerank"),
         required=True,
     )
     preflight_parser.add_argument(
@@ -3291,6 +3906,74 @@ def build_parser() -> argparse.ArgumentParser:
     package_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     package_parser.add_argument("--overwrite", action="store_true")
     package_parser.set_defaults(func=_package_phase1)
+
+    rerank_smoke_parser = subparsers.add_parser(
+        "smoke-rerank",
+        help="run a real pinned-model forward and temporary Phase 2 round trip",
+    )
+    rerank_smoke_parser.add_argument(
+        "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
+    )
+    rerank_smoke_parser.add_argument("--limit", type=int, default=64)
+    rerank_smoke_parser.add_argument(
+        "--device", choices=("auto", "cuda", "mps", "cpu"), default="auto"
+    )
+    rerank_smoke_parser.add_argument(
+        "--output", default="reports/audit/rerank_smoke.json"
+    )
+    rerank_smoke_parser.set_defaults(func=_smoke_rerank)
+
+    rerank_score_parser = subparsers.add_parser(
+        "rerank-score",
+        help="score dev BM25 candidates with guarded sharding and resume",
+    )
+    rerank_score_parser.add_argument(
+        "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
+    )
+    rerank_score_parser.add_argument("--split", choices=("dev",), required=True)
+    rerank_score_parser.add_argument(
+        "--device", choices=("auto", "cuda", "mps", "cpu"), default="auto"
+    )
+    rerank_score_parser.add_argument("--batch-size", type=int, default=None)
+    rerank_score_parser.add_argument("--overwrite", action="store_true")
+    rerank_score_parser.set_defaults(func=_rerank_score)
+
+    rerank_run_parser = subparsers.add_parser(
+        "build-rerank-run",
+        help="build a rank-preserving TREC run from raw float32 scores",
+    )
+    rerank_run_parser.add_argument(
+        "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
+    )
+    rerank_run_parser.add_argument("--split", choices=("dev",), required=True)
+    rerank_run_parser.add_argument(
+        "--depth", type=int, choices=(10, 20, 50, 100), default=100
+    )
+    rerank_run_parser.add_argument("--overwrite", action="store_true")
+    rerank_run_parser.set_defaults(func=_build_rerank_run)
+
+    rerank_evaluate_parser = subparsers.add_parser(
+        "evaluate-rerank",
+        help="run official NIST evaluation and Phase 2 diagnostics",
+    )
+    rerank_evaluate_parser.add_argument(
+        "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
+    )
+    rerank_evaluate_parser.add_argument(
+        "--split", choices=("dev",), required=True
+    )
+    rerank_evaluate_parser.add_argument("--overwrite", action="store_true")
+    rerank_evaluate_parser.set_defaults(func=_evaluate_rerank)
+
+    phase2_package_parser = subparsers.add_parser(
+        "package-phase2",
+        help="snapshot, manifest, package, and revalidate Phase 2 results",
+    )
+    phase2_package_parser.add_argument(
+        "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
+    )
+    phase2_package_parser.add_argument("--overwrite", action="store_true")
+    phase2_package_parser.set_defaults(func=_package_phase2)
     return parser
 
 
