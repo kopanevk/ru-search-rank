@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -252,20 +254,54 @@ def validate_stable_order(run: pd.DataFrame) -> None:
 
 
 def read_trec_run(path: str, *, split: str) -> pd.DataFrame:
-    """Read a six-column TREC run into the normalized BM25 run schema."""
+    """Read and structurally validate an exact six-column TREC run."""
 
+    run_path = Path(path)
+    if not run_path.exists():
+        raise ValueError(f"TREC run does not exist: {run_path}")
+    if not run_path.is_file():
+        raise ValueError(f"TREC run is not a regular file: {run_path}")
+    if run_path.stat().st_size == 0:
+        raise ValueError(f"TREC run is empty: {run_path}")
+    with run_path.open("r", encoding="utf-8") as stream:
+        for line_number, raw_line in enumerate(stream, start=1):
+            fields = raw_line.split()
+            if len(fields) != 6:
+                raise ValueError(
+                    f"TREC run line {line_number} must contain exactly 6 fields; "
+                    f"found {len(fields)} in {run_path}"
+                )
+            if any(not field.strip() for field in (fields[0], fields[2])):
+                raise ValueError(
+                    f"TREC run line {line_number} contains an empty query_id or docid"
+                )
     columns = ["query_id", "q0", "docid", "source_rank", "bm25_score", "tag"]
     run = pd.read_csv(
-        path,
+        run_path,
         sep=r"\s+",
         names=columns,
-        dtype={"query_id": "string", "q0": "string", "docid": "string", "tag": "string"},
+        dtype={column: "string" for column in columns},
         keep_default_na=False,
     )
-    if run.empty:
-        raise ValueError(f"TREC run is empty: {path}")
+    ranks = pd.to_numeric(run["source_rank"], errors="coerce")
+    invalid_ranks = ranks.isna() | ~np.isfinite(ranks) | ranks.le(0) | ranks.mod(1).ne(0)
+    if invalid_ranks.any():
+        first = int(invalid_ranks[invalid_ranks].index[0]) + 1
+        raise ValueError(f"TREC run rank must be a positive integer (line {first})")
+    scores = pd.to_numeric(run["bm25_score"], errors="coerce")
+    if scores.isna().any() or not np.isfinite(scores).all():
+        raise ValueError("TREC run scores must be finite numbers")
+    run["source_rank"] = ranks.astype("int64")
+    run["bm25_score"] = scores.astype("float64")
     run.insert(0, "split", split)
-    return run[["split", "query_id", "docid", "source_rank", "bm25_score", "tag"]]
+    result = run[["split", "query_id", "docid", "source_rank", "bm25_score", "tag"]]
+    ranked = result.rename(columns={"source_rank": "bm25_rank"})
+    validate_top_k(
+        ranked,
+        max(1, int(ranked.groupby(["split", "query_id"]).size().max())),
+        require_exact=False,
+    )
+    return result
 
 
 def write_trec_run(run: pd.DataFrame, path: str, *, tag: str = "rusearchrank-bm25") -> None:

@@ -250,7 +250,7 @@ def test_qrels_join_keeps_unjudged_distinct_and_has_no_row_multiplication() -> N
     result = join_qrels(run, qrels).set_index("docid")
     assert len(result) == len(run)
     assert result.loc["positive", "judgment"] == "relevant"
-    assert result.loc["negative", "judgment"] == "non_relevant"
+    assert result.loc["negative", "judgment"] == "judged_non_relevant"
     assert result.loc["missing", "judgment"] == "unjudged"
     assert bool(result.loc["missing", "is_judged"]) is False
     assert pd.isna(result.loc["missing", "relevance"])
@@ -353,7 +353,7 @@ def test_candidate_cache_rejects_missing_or_failed_reproduction_audit(
     if audit is not None:
         audit_path.write_text(json.dumps(audit), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "_require_external_environment", lambda config: {})
+    monkeypatch.setattr(cli_module, "_preflight_candidate_cache", lambda config: {})
     assert main(["build-candidate-cache", "--config", str(config_path)]) == 1
 
 
@@ -366,14 +366,16 @@ def test_candidate_cache_rejects_hash_from_another_run(
             {
                 "status": "PASS",
                 "gate_passed": True,
+                "overall_pass": True,
                 "source_run": "artifacts/runs/dev_bm25_top1000.trec",
                 "source_run_sha256": hashlib.sha256(b"another run").hexdigest(),
+                "source_run_size_bytes": 26,
             }
         ),
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "_require_external_environment", lambda config: {})
+    monkeypatch.setattr(cli_module, "_preflight_candidate_cache", lambda config: {})
     assert main(["build-candidate-cache", "--config", str(config_path)]) == 1
 
 
@@ -387,8 +389,10 @@ def test_modifying_top1000_after_evaluation_blocks_candidate_cache(
             {
                 "status": "PASS",
                 "gate_passed": True,
+                "overall_pass": True,
                 "source_run": "artifacts/runs/dev_bm25_top1000.trec",
                 "source_run_sha256": evaluated_hash,
+                "source_run_size_bytes": run_path.stat().st_size,
             }
         ),
         encoding="utf-8",
@@ -398,7 +402,7 @@ def test_modifying_top1000_after_evaluation_blocks_candidate_cache(
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "_require_external_environment", lambda config: {})
+    monkeypatch.setattr(cli_module, "_preflight_candidate_cache", lambda config: {})
     assert main(["build-candidate-cache", "--config", str(config_path)]) == 1
 
 
@@ -466,20 +470,22 @@ def test_package_phase1_uses_an_explicit_portable_allowlist(
     ).to_parquet(candidate_dir / "passages.parquet", index=False)
     (audit_dir / "bm25.json").write_text(
         json.dumps(
-            {
-                "status": "PASS",
-                "gate_passed": True,
-                "source_run": str(dev_top1000_path),
-                "source_run_sha256": hashlib.sha256(
-                    dev_top1000_path.read_bytes()
-                ).hexdigest(),
-                "official_tool_values": {},
+                {
+                    "status": "PASS",
+                    "gate_passed": True,
+                    "overall_pass": True,
+                    "source_run": str(dev_top1000_path),
+                    "source_run_sha256": hashlib.sha256(
+                        dev_top1000_path.read_bytes()
+                    ).hexdigest(),
+                    "source_run_size_bytes": dev_top1000_path.stat().st_size,
+                    "official_tool_values": {},
             }
         ),
         encoding="utf-8",
     )
     (audit_dir / "qrels.json").write_text(
-        json.dumps({"status": "COMPLETED"}), encoding="utf-8"
+        json.dumps({"status": "PASS"}), encoding="utf-8"
     )
     Path("artifacts/cache").mkdir()
     Path("artifacts/cache/secret-index.bin").write_bytes(b"must not be packaged")
@@ -557,6 +563,56 @@ def test_package_phase1_uses_an_explicit_portable_allowlist(
     config_path = Path("retrieval.yaml")
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
+    monkeypatch.setattr(cli_module, "_preflight_candidate_cache", lambda config: {})
+    loaded = cli_module._load_retrieval_config(config_path)
+    annotation_paths = {
+        split: {"topics": train_topics_path, "qrels": train_topics_path}
+        for split in ("train", "dev")
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "_validate_official_annotations",
+        lambda config: (annotation_paths, {}),
+    )
+    cache_inputs = cli_module._candidate_input_metadata(
+        loaded,
+        annotation_paths,
+        reproduction_path=audit_dir / "bm25.json",
+        dev_top100_path=dev_top100_path,
+    )
+    cache_outputs = {
+        name: cli_module._file_metadata(loaded, path)
+        for name, path in cli_module._candidate_output_paths(loaded).items()
+    }
+    (work_dir / "candidate_cache.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "input_artifacts": cache_inputs,
+                "output_artifacts": cache_outputs,
+                "retrieval_depth": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    qrels_splits = {}
+    for split in ("train", "dev"):
+        qrels_splits[split] = {
+            "inputs": {
+                "topics": cli_module._file_metadata(loaded, train_topics_path),
+                "qrels": cli_module._file_metadata(loaded, train_topics_path),
+                "candidates": cli_module._file_metadata(
+                    loaded, candidate_dir / f"{split}_top100.parquet"
+                ),
+                "queries": cli_module._file_metadata(
+                    loaded, candidate_dir / "queries.parquet"
+                ),
+            }
+        }
+    (audit_dir / "qrels.json").write_text(
+        json.dumps({"status": "PASS", "splits": qrels_splits}), encoding="utf-8"
+    )
+
     assert main(["package-phase1", "--config", str(config_path), "--overwrite"]) == 0
     with zipfile.ZipFile("artifacts/results.zip") as archive:
         names = set(archive.namelist())
@@ -603,9 +659,10 @@ def test_colab_runner_gates_top100_cache_after_official_dev_top1000() -> None:
     assert "TREC_EVAL_TAG = 'v9.0.8'" in cells[3]
     assert "/usr/local/bin/trec_eval" in cells[3]
     assert "'-m', 'pytest', '-q'" in cells[5]
-    assert cells[6].index("prepare-annotations") < cells[6].index(
-        "inspect-linux-environment"
+    assert cells[6].index("cli('prepare-annotations'") < cells[6].index(
+        "cli('preflight'"
     )
+    assert "'--stage', 'retrieval', '--check-index'" in cells[6]
     assert "'--split', 'train'" in cells[7]
     assert "'--split', 'dev'" in cells[8]
     assert "evaluate-bm25" in cells[9]
@@ -709,8 +766,10 @@ def test_missing_train_topics_blocks_before_pyserini(
         raise AssertionError("Pyserini must not run")
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "_require_external_environment", lambda config: {})
-    monkeypatch.setattr(cli_module.subprocess, "run", fail_if_called)
+    monkeypatch.setattr(
+        cli_module, "_preflight_retrieval", lambda config, check_index: {}
+    )
+    monkeypatch.setattr(cli_module, "_run_streaming_process", fail_if_called)
     assert main(["run-bm25", "--config", str(config_path), "--split", "train"]) == 1
     assert pyserini_called is False
     assert "prepare-annotations" in capsys.readouterr().err
@@ -774,7 +833,7 @@ def test_invalid_pyserini_run_is_preserved_with_diagnostic_path(
     contents = "".join(f"q{index}\tquery {index}\n" for index in range(4683))
     config_path = _write_topics_command_config(tmp_path, contents=contents)
 
-    def fake_pyserini(command: list[str], **kwargs: object) -> object:
+    def fake_pyserini(command: list[str], **kwargs: object) -> dict[str, object]:
         output = Path(_argument_after(command, "--output"))
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
@@ -784,15 +843,13 @@ def test_invalid_pyserini_run_is_preserved_with_diagnostic_path(
             ),
             encoding="utf-8",
         )
-        return type(
-            "CompletedProcess",
-            (),
-            {"returncode": 0, "stdout": "", "stderr": ""},
-        )()
+        return {"returncode": 0, "stdout": "", "stderr": ""}
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "_require_external_environment", lambda config: {})
-    monkeypatch.setattr(cli_module.subprocess, "run", fake_pyserini)
+    monkeypatch.setattr(
+        cli_module, "_preflight_retrieval", lambda config, check_index: {}
+    )
+    monkeypatch.setattr(cli_module, "_run_streaming_process", fake_pyserini)
     assert main(["run-bm25", "--config", str(config_path), "--split", "train"]) == 1
     temporary = tmp_path / "artifacts/runs/train_bm25_top100.trec.tmp"
     assert temporary.is_file()
