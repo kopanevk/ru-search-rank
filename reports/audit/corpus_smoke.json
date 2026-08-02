@@ -1,0 +1,205 @@
+{
+  "status": "PASS",
+  "stage": "real-corpus-smoke",
+  "started_at": "2026-08-02T12:40:09.271084+00:00",
+  "finished_at": "2026-08-02T12:40:22.520124+00:00",
+  "source": {
+    "kind": "huggingface_hub",
+    "repo_id": "miracl/miracl-corpus",
+    "repo_type": "dataset",
+    "revision": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+    "language": "ru",
+    "shard_count": 20,
+    "cache_dir": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/hf-corpus",
+    "loader": "hf_hub_download + gzip + json.loads",
+    "dataset_script_used": false,
+    "trust_remote_code": false
+  },
+  "shard": "miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+  "rows_parsed": 2000,
+  "requested_passages": 25,
+  "extraction": {
+    "status": "PASS",
+    "source": {
+      "kind": "single_shard",
+      "shard": "miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+      "path": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/hf-corpus/datasets--miracl--miracl-corpus/snapshots/d921ec7e349ce0d28daf30b2da9da5ee698bef0d/miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+      "loader": "gzip + json.loads",
+      "dataset_script_used": false,
+      "trust_remote_code": false
+    },
+    "required_docids": 25,
+    "found_docids": 25,
+    "missing_docids": 0,
+    "duplicate_corpus_docids": 0,
+    "extra_rows": 0,
+    "empty_titles": 0,
+    "rows_written": 25,
+    "batches_written": 4,
+    "batch_rows": 8,
+    "shards_total": 1,
+    "shards_visited": 1,
+    "shards_skipped_by_early_stop": 0,
+    "lines_visited": 1921,
+    "early_stop": false,
+    "preserved_partial_from_previous_run": null,
+    "output_path": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/phase1/rusearchrank-corpus-smoke-3mgcn_7h/smoke_passages.parquet",
+    "output_size_bytes": 29124,
+    "seconds": 0.014912041020579636
+  },
+  "checks": [
+    {
+      "check": "pinned_revision_available",
+      "status": "PASS",
+      "repo_id": "miracl/miracl-corpus",
+      "revision": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+      "resolution": {
+        "repo_id": "miracl/miracl-corpus",
+        "revision": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+        "resolved_sha": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+        "shard_count": 20,
+        "shards": [
+          "miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-1.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-2.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-3.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-4.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-5.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-6.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-7.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-8.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-9.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-10.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-11.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-12.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-13.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-14.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-15.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-16.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-17.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-18.jsonl.gz",
+          "miracl-corpus-v1.0-ru/docs-19.jsonl.gz"
+        ],
+        "shard_sizes_bytes": {
+          "miracl-corpus-v1.0-ru/docs-0.jsonl.gz": 100436081,
+          "miracl-corpus-v1.0-ru/docs-1.jsonl.gz": 98036311,
+          "miracl-corpus-v1.0-ru/docs-2.jsonl.gz": 90050391,
+          "miracl-corpus-v1.0-ru/docs-3.jsonl.gz": 89443294,
+          "miracl-corpus-v1.0-ru/docs-4.jsonl.gz": 82032411,
+          "miracl-corpus-v1.0-ru/docs-5.jsonl.gz": 88457515,
+          "miracl-corpus-v1.0-ru/docs-6.jsonl.gz": 81102964,
+          "miracl-corpus-v1.0-ru/docs-7.jsonl.gz": 80229752,
+          "miracl-corpus-v1.0-ru/docs-8.jsonl.gz": 74478227,
+          "miracl-corpus-v1.0-ru/docs-9.jsonl.gz": 73515957,
+          "miracl-corpus-v1.0-ru/docs-10.jsonl.gz": 75656001,
+          "miracl-corpus-v1.0-ru/docs-11.jsonl.gz": 78271034,
+          "miracl-corpus-v1.0-ru/docs-12.jsonl.gz": 76539873,
+          "miracl-corpus-v1.0-ru/docs-13.jsonl.gz": 78171375,
+          "miracl-corpus-v1.0-ru/docs-14.jsonl.gz": 78271662,
+          "miracl-corpus-v1.0-ru/docs-15.jsonl.gz": 79432861,
+          "miracl-corpus-v1.0-ru/docs-16.jsonl.gz": 81415343,
+          "miracl-corpus-v1.0-ru/docs-17.jsonl.gz": 81955644,
+          "miracl-corpus-v1.0-ru/docs-18.jsonl.gz": 81041807,
+          "miracl-corpus-v1.0-ru/docs-19.jsonl.gz": 6749385
+        },
+        "dataset_script_used": false,
+        "trust_remote_code": false
+      }
+    },
+    {
+      "check": "no_dataset_script_loader",
+      "status": "PASS",
+      "denied": [
+        "miracl-corpus.py"
+      ],
+      "loader": "hf_hub_download + gzip + json.loads",
+      "datasets_load_dataset_used": false,
+      "trust_remote_code": false
+    },
+    {
+      "check": "numeric_shard_order",
+      "status": "PASS",
+      "first": [
+        "miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+        "miracl-corpus-v1.0-ru/docs-1.jsonl.gz",
+        "miracl-corpus-v1.0-ru/docs-2.jsonl.gz"
+      ],
+      "last": [
+        "miracl-corpus-v1.0-ru/docs-17.jsonl.gz",
+        "miracl-corpus-v1.0-ru/docs-18.jsonl.gz",
+        "miracl-corpus-v1.0-ru/docs-19.jsonl.gz"
+      ],
+      "count": 20
+    },
+    {
+      "check": "shard_available",
+      "status": "PASS",
+      "shard": "miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+      "local_path": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/hf-corpus/datasets--miracl--miracl-corpus/snapshots/d921ec7e349ce0d28daf30b2da9da5ee698bef0d/miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+      "size_bytes": 100436081
+    },
+    {
+      "check": "gzip_json_fields_and_string_docid",
+      "status": "PASS",
+      "shard": "miracl-corpus-v1.0-ru/docs-0.jsonl.gz",
+      "rows_parsed": 2000,
+      "fields": [
+        "docid",
+        "title",
+        "text"
+      ],
+      "docid_type": "str",
+      "first_docids": [
+        "7#0",
+        "7#1",
+        "7#2"
+      ]
+    },
+    {
+      "check": "real_passage_filtering",
+      "status": "PASS",
+      "requested": 25,
+      "found": 25,
+      "batches_written": 4,
+      "lines_visited": 1921,
+      "early_stop": false
+    },
+    {
+      "check": "parquet_write_and_read_back",
+      "status": "PASS",
+      "path": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/phase1/rusearchrank-corpus-smoke-3mgcn_7h/smoke_passages.parquet",
+      "rows": 25,
+      "columns": [
+        "docid",
+        "title",
+        "text"
+      ],
+      "size_bytes": 29124
+    },
+    {
+      "check": "temporary_manifest",
+      "status": "PASS",
+      "path": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/phase1/rusearchrank-corpus-smoke-3mgcn_7h/smoke_manifest.json",
+      "entries": 1
+    },
+    {
+      "check": "zip_created_and_extracted",
+      "status": "PASS",
+      "path": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/phase1/rusearchrank-corpus-smoke-3mgcn_7h/smoke_results.zip",
+      "size_bytes": 16533,
+      "members": [
+        "smoke_passages.parquet",
+        "smoke_manifest.json"
+      ]
+    },
+    {
+      "check": "hash_revalidated_after_extraction",
+      "status": "PASS",
+      "sha256": "33fa57e82a5e64d40d7976bdd1acac75107f290fb5cf80a13a375ca624e24e12",
+      "rows": 25
+    }
+  ],
+  "full_corpus_downloaded": false,
+  "production_artifacts_written": [],
+  "temporary_root": "/Users/mac/PycharmProjects/ru-search-rank/artifacts/work/phase1/rusearchrank-corpus-smoke-3mgcn_7h"
+}

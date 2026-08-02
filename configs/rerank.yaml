@@ -1,0 +1,92 @@
+implementation:
+  version: "2.0.0"
+  score_schema_version: 1
+  source_files:
+    - src/rusearchrank/rerank.py
+    - src/rusearchrank/cli.py
+    - src/rusearchrank/evaluation.py
+    - configs/rerank.yaml
+    - pyproject.toml
+
+model:
+  id: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+  revision: 1427fd652930e4ba29e8149678df786c240d8825
+  tokenizer_revision: 1427fd652930e4ba29e8149678df786c240d8825
+  tag: mminilmv2l12
+  num_labels: 1
+  score_activation: identity
+  score_direction: higher_is_more_relevant
+
+input:
+  max_length: 320
+  truncation: only_second
+  title_separator: "\n"
+  pair_order: query_document
+
+inference:
+  batch_size: 64
+  cpu_batch_size: 16
+  device: auto
+  cuda_dtype: float16
+  fallback_dtype: float32
+  score_dtype: float32
+  shard_queries: 64
+  seed: 20260802
+  minimum_available_memory_gib: 3
+
+protocol:
+  split: dev
+  official_depth: 100
+  diagnostic_depths: [10, 20, 50]
+  internal_tie_break: raw_score_desc_then_docid_asc
+  trec_score_encoding: rank_preserving
+  trec_score_base: 1000000
+  trec_score_format: "%.4f"
+
+inputs:
+  candidates: artifacts/candidates/dev_top100.parquet
+  queries: artifacts/candidates/queries.parquet
+  passages: artifacts/candidates/passages.parquet
+  bm25_run: artifacts/runs/dev_bm25_top100.trec
+  bm25_top1000_run: artifacts/runs/dev_bm25_top1000.trec
+  qrels: artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv
+  phase1_manifest: reports/audit/candidate_cache_manifest.json
+
+artifacts:
+  scores: artifacts/scores/dev_zeroshot_mminilmv2l12.parquet
+  partial_dir: artifacts/scores/_partial
+  rerank_run: artifacts/runs/dev_rerank_zeroshot_k100.trec
+  diagnostic_run_template: artifacts/runs/dev_rerank_zeroshot_k{depth}.trec
+
+metrics:
+  baseline: reports/metrics/dev_bm25_baseline.json
+  system: reports/metrics/dev_zeroshot_mminilmv2l12.json
+  comparison: reports/metrics/dev_zeroshot_vs_bm25.json
+  depth_profile: reports/metrics/dev_zeroshot_depth_profile.json
+
+audits:
+  manifest: reports/audit/rerank_manifest.json
+  protocol_snapshot: reports/audit/rerank_protocol.yaml
+  smoke: reports/audit/rerank_smoke.json
+
+evaluation:
+  trec_eval_executable: trec_eval
+  trec_eval_version: "9.0.8"
+  ndcg_command: [-c, -M, "100", -m, ndcg_cut.10]
+  recall_command: [-c, -m, recall.100]
+  per_query_command: [-c, -M, "100", -q, -m, ndcg_cut.10]
+  mrr_command: [-c, -M, "10", -m, recip_rank]
+  python_vs_trec_eval_tolerance: 0.0001
+  bootstrap_resamples: 10000
+  bootstrap_seed: 20260802
+  bootstrap_confidence: 0.95
+  expected_bm25_ndcg_at_10: 0.3342
+  expected_bm25_recall_at_100: 0.6614
+  expected_recall_invariant: strict_set_equality
+
+archive:
+  path: artifacts/rusearchrank_phase2_results.zip
+
+paths:
+  repository_root: ..
+  work_dir: artifacts/work/phase2

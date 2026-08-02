@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -379,4 +379,389 @@ def build_qrels_split_audit(
         "per_query_coverage": coverage.to_dict(orient="records"),
         "known_positives_retrieved_at_100": int(len(retrieved_positive_pairs)),
         "retrieval_failures": int(sum(query_id not in candidate_queries for query_id in query_ids)),
+    }
+
+
+def parse_trec_eval_per_query(output: str, metric: str) -> dict[str, float]:
+    """Parse the finite per-query vector emitted by ``trec_eval -q``."""
+
+    values: dict[str, float] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0] != metric or parts[1] == "all":
+            continue
+        query_id = str(parts[1])
+        if query_id in values:
+            raise ValueError(f"duplicate {metric} value for query {query_id!r}")
+        try:
+            value = float(parts[2])
+        except ValueError as exc:
+            raise ValueError(f"invalid trec_eval per-query line: {line}") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite trec_eval value for query {query_id!r}")
+        values[query_id] = value
+    if not values:
+        raise ValueError(f"trec_eval output contains no per-query {metric!r} values")
+    return values
+
+
+def assert_candidate_set_invariant(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+) -> dict[str, Any]:
+    """Prove Recall@100's load-bearing invariant by exact key-set equality."""
+
+    for label, frame in (("left", left), ("right", right)):
+        _require_columns(frame, {"query_id", "docid"}, label)
+        if frame[["query_id", "docid"]].isna().any().any():
+            raise ValueError(f"{label} candidate keys contain nulls")
+        if frame[["query_id", "docid"]].astype("string").duplicated().any():
+            raise ValueError(f"{label} candidate keys contain duplicates")
+    left_keys = set(
+        map(tuple, left[["query_id", "docid"]].astype("string").to_numpy())
+    )
+    right_keys = set(
+        map(tuple, right[["query_id", "docid"]].astype("string").to_numpy())
+    )
+    if left_keys != right_keys:
+        missing = sorted(left_keys.difference(right_keys))[:10]
+        extra = sorted(right_keys.difference(left_keys))[:10]
+        raise ValueError(
+            f"Recall@100 candidate-set invariant failed: missing={missing}, extra={extra}"
+        )
+    return {
+        "candidate_set_invariant": True,
+        "pair_count": len(left_keys),
+        "query_count": int(left["query_id"].astype("string").nunique()),
+    }
+
+
+def paired_bootstrap(
+    deltas: Iterable[float],
+    *,
+    resamples: int = 10_000,
+    seed: int = 20260802,
+    confidence: float = 0.95,
+) -> dict[str, Any]:
+    """Percentile CI for the paired mean, reproducible for a fixed seed."""
+
+    values = np.asarray(list(deltas), dtype=np.float64)
+    if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("paired bootstrap requires a non-empty finite vector")
+    if resamples <= 0 or not 0.0 < confidence < 1.0:
+        raise ValueError("bootstrap resamples/confidence are invalid")
+    rng = np.random.default_rng(seed)
+    means = np.empty(resamples, dtype=np.float64)
+    for index in range(resamples):
+        sample_indices = rng.integers(0, values.size, size=values.size)
+        means[index] = float(values[sample_indices].mean())
+    alpha = (1.0 - confidence) / 2.0
+    low, high = np.quantile(means, [alpha, 1.0 - alpha])
+    return {
+        "resamples": int(resamples),
+        "seed": int(seed),
+        "confidence": float(confidence),
+        "mean_delta": float(values.mean()),
+        "ci_low": float(low),
+        "ci_high": float(high),
+    }
+
+
+def paired_ranking_comparison(
+    baseline: Mapping[str, float],
+    system: Mapping[str, float],
+    *,
+    resamples: int = 10_000,
+    seed: int = 20260802,
+    confidence: float = 0.95,
+    tie_tolerance: float = 1e-9,
+) -> dict[str, Any]:
+    if set(baseline) != set(system):
+        missing = sorted(set(baseline).difference(system))[:10]
+        extra = sorted(set(system).difference(baseline))[:10]
+        raise ValueError(
+            f"paired metric query universes differ: missing={missing}, extra={extra}"
+        )
+    query_ids = sorted(baseline)
+    deltas = np.asarray(
+        [float(system[qid]) - float(baseline[qid]) for qid in query_ids],
+        dtype=np.float64,
+    )
+    if not np.isfinite(deltas).all():
+        raise ValueError("paired deltas contain non-finite values")
+    ties = np.abs(deltas) < tie_tolerance
+    return {
+        "query_count": len(query_ids),
+        "improved": int((deltas >= tie_tolerance).sum()),
+        "degraded": int((deltas <= -tie_tolerance).sum()),
+        "tie": int(ties.sum()),
+        "mean_delta": float(deltas.mean()),
+        "median_delta": float(np.median(deltas)),
+        "min_delta": float(deltas.min()),
+        "max_delta": float(deltas.max()),
+        "tie_tolerance": float(tie_tolerance),
+        "per_query": [
+            {
+                "query_id": query_id,
+                "baseline_ndcg_at_10": float(baseline[query_id]),
+                "system_ndcg_at_10": float(system[query_id]),
+                "delta": float(delta),
+            }
+            for query_id, delta in zip(query_ids, deltas, strict=True)
+        ],
+        "paired_bootstrap": paired_bootstrap(
+            deltas,
+            resamples=resamples,
+            seed=seed,
+            confidence=confidence,
+        ),
+    }
+
+
+def _normalise_ranking(ranking: pd.DataFrame) -> pd.DataFrame:
+    _require_columns(ranking, {"query_id", "docid"}, "ranking")
+    rank_column = "rank" if "rank" in ranking.columns else "bm25_rank"
+    _require_columns(ranking, {rank_column}, "ranking")
+    result = ranking[["query_id", "docid", rank_column]].copy()
+    result.columns = ["query_id", "docid", "bm25_rank"]
+    result[["query_id", "docid"]] = result[["query_id", "docid"]].astype("string")
+    ranks = pd.to_numeric(result["bm25_rank"], errors="coerce")
+    invalid = ranks.isna() | ~np.isfinite(ranks) | ranks.le(0) | ranks.mod(1).ne(0)
+    if invalid.any():
+        raise ValueError("ranking contains invalid ranks")
+    result["bm25_rank"] = ranks.astype("int64")
+    if result.duplicated(["query_id", "docid"], keep=False).any():
+        raise ValueError("ranking contains duplicate query-doc pairs")
+    if result.duplicated(["query_id", "bm25_rank"], keep=False).any():
+        raise ValueError("ranking contains duplicate ranks within a query")
+    return result
+
+
+def _candidate_states(candidates: pd.DataFrame) -> pd.DataFrame:
+    required = {"query_id", "docid", "judgment", "relevance_grade"}
+    _require_columns(candidates, required, "candidate judgments")
+    states = candidates[list(required)].copy()
+    states[["query_id", "docid", "judgment"]] = states[
+        ["query_id", "docid", "judgment"]
+    ].astype("string")
+    if states.duplicated(["query_id", "docid"], keep=False).any():
+        raise ValueError("candidate judgments contain duplicate keys")
+    grades = pd.to_numeric(states["relevance_grade"], errors="coerce")
+    states["is_judged"] = grades.notna()
+    states["is_relevant"] = grades.fillna(0).gt(0) & states["is_judged"]
+    expected_unjudged = states["judgment"].eq("unjudged")
+    if not np.array_equal(
+        expected_unjudged.fillna(False).to_numpy(dtype=bool),
+        (~states["is_judged"]).to_numpy(dtype=bool),
+    ):
+        raise ValueError("unjudged candidates do not preserve null relevance grades")
+    return states
+
+
+def _oracle_ranking(candidates: pd.DataFrame) -> pd.DataFrame:
+    states = _candidate_states(candidates)
+    bm25_column = "bm25_rank" if "bm25_rank" in candidates.columns else None
+    if bm25_column is None:
+        states["source_rank"] = states.groupby("query_id", sort=False).cumcount() + 1
+    else:
+        states["source_rank"] = pd.to_numeric(
+            candidates[bm25_column], errors="raise"
+        ).astype("int64")
+    states = states.sort_values(
+        ["query_id", "is_relevant", "source_rank", "docid"],
+        ascending=[True, False, True, True],
+        kind="mergesort",
+    )
+    states["bm25_rank"] = states.groupby("query_id", sort=False).cumcount() + 1
+    return states[["query_id", "docid", "bm25_rank"]]
+
+
+def sparse_judgment_diagnostics(
+    *,
+    candidates: pd.DataFrame,
+    qrels: pd.DataFrame,
+    ranking: pd.DataFrame,
+    bm25_ranking: pd.DataFrame | None = None,
+    query_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Compute standard/condensed and unjudged-vs-relevant diagnostics."""
+
+    system = _normalise_ranking(ranking)
+    states = _candidate_states(candidates)
+    candidate_keys = set(
+        map(tuple, states[["query_id", "docid"]].astype("string").to_numpy())
+    )
+    system_keys = set(
+        map(tuple, system[["query_id", "docid"]].astype("string").to_numpy())
+    )
+    if system_keys != candidate_keys:
+        raise ValueError("diagnostic ranking does not exactly cover candidate keys")
+    labels = _normalise_qrels(qrels)
+    universe = (
+        list(dict.fromkeys(str(value) for value in query_ids))
+        if query_ids is not None
+        else list(dict.fromkeys(labels["query_id"].astype("string").tolist()))
+    )
+    standard = evaluate_bm25_metrics(
+        system,
+        labels,
+        query_ids=universe,
+        ndcg_cutoff=10,
+        recall_cutoff=100,
+    )
+    metric_by_query = {
+        str(row["query_id"]): row for row in standard["per_query"]
+    }
+    joined = system.merge(
+        states[["query_id", "docid", "is_judged", "is_relevant"]],
+        on=["query_id", "docid"],
+        how="inner",
+        validate="one_to_one",
+    )
+    ranking_groups = {
+        str(query_id): group.sort_values("bm25_rank", kind="mergesort")
+        for query_id, group in joined.groupby("query_id", sort=False)
+    }
+    candidate_groups = {
+        str(query_id): group
+        for query_id, group in states.groupby("query_id", sort=False)
+    }
+    queries_without_judged = 0
+    queries_without_relevant = 0
+    unjudged_counts: list[int] = []
+    inversion_queries = 0
+    inversion_pairs = 0
+    eligible: list[str] = []
+    for query_id in universe:
+        candidate_group = candidate_groups.get(query_id)
+        if candidate_group is None or not bool(candidate_group["is_judged"].any()):
+            queries_without_judged += 1
+        else:
+            eligible.append(query_id)
+        if candidate_group is None or not bool(candidate_group["is_relevant"].any()):
+            queries_without_relevant += 1
+        group = ranking_groups.get(query_id)
+        if group is None:
+            unjudged_counts.append(10)
+            continue
+        top10 = group.loc[group["bm25_rank"].le(10)]
+        unjudged_top = top10.loc[~top10["is_judged"]]
+        unjudged_counts.append(int(len(unjudged_top)))
+        relevant_ranks = group.loc[group["is_relevant"], "bm25_rank"].astype("int64")
+        query_inversions = sum(
+            int((relevant_ranks > int(unjudged_rank)).sum())
+            for unjudged_rank in unjudged_top["bm25_rank"]
+        )
+        inversion_pairs += query_inversions
+        inversion_queries += int(query_inversions > 0)
+
+    oracle = _oracle_ranking(candidates)
+    oracle_metrics = evaluate_bm25_metrics(
+        oracle,
+        labels,
+        query_ids=universe,
+        ndcg_cutoff=10,
+        recall_cutoff=100,
+    )
+    oracle_by_query = {
+        str(row["query_id"]): float(row["ndcg_at_10"])
+        for row in oracle_metrics["per_query"]
+    }
+    at_oracle = None
+    if bm25_ranking is not None:
+        baseline = evaluate_bm25_metrics(
+            _normalise_ranking(bm25_ranking),
+            labels,
+            query_ids=universe,
+            ndcg_cutoff=10,
+            recall_cutoff=100,
+        )
+        baseline_by_query = {
+            str(row["query_id"]): float(row["ndcg_at_10"])
+            for row in baseline["per_query"]
+        }
+        at_oracle = sum(
+            math.isclose(
+                baseline_by_query[query_id],
+                oracle_by_query[query_id],
+                abs_tol=1e-12,
+            )
+            for query_id in universe
+        )
+    subset_rows = [metric_by_query[query_id] for query_id in eligible]
+    subset = {
+        "query_count": len(eligible),
+        "ndcg_at_10": float(np.mean([row["ndcg_at_10"] for row in subset_rows]))
+        if subset_rows
+        else 0.0,
+        "condensed_ndcg_at_10": float(
+            np.mean([row["condensed_ndcg_at_10"] for row in subset_rows])
+        )
+        if subset_rows
+        else 0.0,
+        "judged_at_10": float(np.mean([row["judged_at_10"] for row in subset_rows]))
+        if subset_rows
+        else 0.0,
+    }
+    return {
+        "diagnostic": True,
+        "judged_at_10": float(standard["aggregate"]["judged_at_10"]),
+        "mean_unjudged_in_top10": float(np.mean(unjudged_counts)),
+        "condensed_ndcg_at_10": float(
+            standard["aggregate"]["condensed_ndcg_at_10"]
+        ),
+        "queries_without_judged_candidate": int(queries_without_judged),
+        "queries_without_relevant_candidate": int(queries_without_relevant),
+        "queries_at_oracle_under_bm25": (
+            int(at_oracle) if at_oracle is not None else None
+        ),
+        "oracle_ndcg_at_10_over_candidates": float(
+            oracle_metrics["aggregate"]["ndcg_at_10"]
+        ),
+        "queries_with_unjudged_above_relevant": int(inversion_queries),
+        "pairwise_unjudged_relevant_inversions": int(inversion_pairs),
+        "excluding_queries_without_judged_candidate": subset,
+        "per_query_metrics": standard["per_query"],
+        "oracle_per_query": oracle_by_query,
+    }
+
+
+def stratified_delta_summary(
+    *,
+    candidates: pd.DataFrame,
+    baseline_per_query: Mapping[str, float],
+    system_per_query: Mapping[str, float],
+    oracle_per_query: Mapping[str, float],
+) -> dict[str, Any]:
+    states = _candidate_states(candidates)
+    relevant_by_query = states.groupby("query_id", sort=False)["is_relevant"].any()
+    strata: dict[str, list[float]] = {
+        "no_relevant_in_candidates": [],
+        "already_at_oracle": [],
+        "improvable": [],
+    }
+    if set(baseline_per_query) != set(system_per_query) or set(baseline_per_query) != set(
+        oracle_per_query
+    ):
+        raise ValueError("stratification query universes differ")
+    for query_id in sorted(baseline_per_query):
+        if not bool(relevant_by_query.get(query_id, False)):
+            label = "no_relevant_in_candidates"
+        elif math.isclose(
+            float(baseline_per_query[query_id]),
+            float(oracle_per_query[query_id]),
+            abs_tol=1e-12,
+        ):
+            label = "already_at_oracle"
+        else:
+            label = "improvable"
+        strata[label].append(
+            float(system_per_query[query_id]) - float(baseline_per_query[query_id])
+        )
+    return {
+        label: {
+            "query_count": len(values),
+            "mean_delta": float(np.mean(values)) if values else 0.0,
+        }
+        for label, values in strata.items()
     }
