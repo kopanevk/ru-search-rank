@@ -1,0 +1,5 @@
+{
+  "status": "BLOCKED_EXTERNAL_RUN",
+  "runner": "scripts/run_full_bm25_retrieval.ipynb",
+  "artifacts": []
+}

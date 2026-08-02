@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "checked_at": "2026-08-02T08:07:33.235891+00:00",
+  "checkpoint_name": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+  "requested_revision": "main",
+  "resolved_revision": "1427fd652930e4ba29e8149678df786c240d8825",
+  "model_class": "XLMRobertaForSequenceClassification",
+  "tokenizer_class": "XLMRobertaTokenizer",
+  "num_labels": 1,
+  "sep_token": "</s>",
+  "sep_token_id": 2,
+  "model_max_length": 512,
+  "smoke_max_length": 256,
+  "score_activation": "torch.nn.modules.linear.Identity",
+  "score_direction": "higher_is_more_relevant",
+  "safetensors_element_count": 117641603,
+  "pair_tokenization": {
+    "format": "tokenizer(query, title + '\\n' + text, truncation=True, max_length=...)",
+    "literal_sep_inserted": false,
+    "input_shape": [
+      1,
+      19
+    ],
+    "sep_token_count": 3
+  },
+  "weights_loaded": true,
+  "parameter_count": 117641089,
+  "word_embeddings_parameter_path": "roberta.embeddings.word_embeddings.weight",
+  "logits_shape": [
+    3,
+    1
+  ],
+  "cpu_smoke": {
+    "status": "passed",
+    "scores": {
+      "clearly_relevant": 6.12877082824707,
+      "clearly_irrelevant": -6.253462314605713,
+      "neutral": -0.8283607959747314
+    },
+    "finite": true,
+    "not_all_identical": true,
+    "higher_is_more_relevant_check": true
+  },
+  "mps_smoke": {
+    "available": true,
+    "status": "passed",
+    "logits_shape": [
+      3,
+      1
+    ],
+    "scores": {
+      "clearly_relevant": 6.1287665367126465,
+      "clearly_irrelevant": -6.25345516204834,
+      "neutral": -0.8283591866493225
+    }
+  }
+}

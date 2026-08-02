@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "checked_at": "2026-08-02T08:06:27.479484+00:00",
+  "language": "ru",
+  "sources": {
+    "corpus_dataset": "miracl/miracl-corpus",
+    "corpus_revision": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+    "annotations_dataset": "miracl/miracl",
+    "annotations_revision": "5be20db9509754dadad47689368639fcec739c00"
+  },
+  "corpus": {
+    "fields": {
+      "docid": "string",
+      "title": "string",
+      "text": "string"
+    },
+    "sample_size": 3,
+    "sample": [
+      {
+        "docid": "7#0",
+        "title": "Литва",
+        "text": "Литва́ (), официальное название — Лито́вская Респу́блика () — государство, расположенное в северо-восточной части Европы. Столица страны — Вильнюс."
+      },
+      {
+        "docid": "7#1",
+        "title": "Литва",
+        "text": "Площадь — км². Протяжённость с севера на юг — 280 км, а с запада на восток — 370 км. Население составляет человек — по этим показателям является крупнейшим прибалтийским государством. Имеет выход к Балтийскому морю, расположена на его восточном побережье. Береговая линия составляет всего 99 км (наименьший показатель среди прибалтийских государств). На севере граничит с Латвией, на юго-востоке — с Белоруссией, на юго-западе — с Польшей и Калининградской областью России."
+      },
+      {
+        "docid": "7#2",
+        "title": "Литва",
+        "text": "Член ООН с 1991 года, ЕС и НАТО — с 2004 года, ОЭСР — с мая 2018 года. Входит в Шенгенскую зону и Еврозону."
+      }
+    ],
+    "sample_api_url": "https://datasets-server.huggingface.co/rows?dataset=miracl%2Fmiracl-corpus&config=ru&split=train&offset=0&length=3",
+    "viewer_partial": true,
+    "full_corpus_downloaded": false
+  },
+  "splits": {
+    "train": {
+      "queries": {
+        "fields": {
+          "query_id": "string",
+          "query": "string"
+        },
+        "row_count": 4683,
+        "sample": [
+          {
+            "query_id": "1",
+            "query": "Когда был спущен на воду первый миноносец «Спокойный»?"
+          },
+          {
+            "query_id": "4",
+            "query": "Как долго существовало британское телевизионное игровое шоу \"Хрустальный лабиринт\"?"
+          },
+          {
+            "query_id": "6",
+            "query": "Когда родилась Князева Марина Леонидовна?"
+          }
+        ],
+        "source_url": "https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-train.tsv"
+      },
+      "qrels": {
+        "fields": {
+          "query_id": "string",
+          "iteration": "string",
+          "docid": "string",
+          "relevance": "int64"
+        },
+        "row_count": 33921,
+        "iteration_values": [
+          "Q0"
+        ],
+        "relevance_values": [
+          0,
+          1
+        ],
+        "sample": [
+          {
+            "query_id": "1",
+            "iteration": "Q0",
+            "docid": "2183682#1",
+            "relevance": 1
+          },
+          {
+            "query_id": "1",
+            "iteration": "Q0",
+            "docid": "770018#0",
+            "relevance": 0
+          },
+          {
+            "query_id": "1",
+            "iteration": "Q0",
+            "docid": "1517883#7",
+            "relevance": 0
+          }
+        ],
+        "source_url": "https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/qrels/qrels.miracl-v1.0-ru-train.tsv"
+      }
+    },
+    "dev": {
+      "queries": {
+        "fields": {
+          "query_id": "string",
+          "query": "string"
+        },
+        "row_count": 1252,
+        "sample": [
+          {
+            "query_id": "0",
+            "query": "Когда начался Кари́бский кризис?"
+          },
+          {
+            "query_id": "2",
+            "query": "Как называлась Симбирская губерния с 1924?"
+          },
+          {
+            "query_id": "3",
+            "query": "Какое расстояние от Коло́мны до Москвы?"
+          }
+        ],
+        "source_url": "https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-dev.tsv"
+      },
+      "qrels": {
+        "fields": {
+          "query_id": "string",
+          "iteration": "string",
+          "docid": "string",
+          "relevance": "int64"
+        },
+        "row_count": 13100,
+        "iteration_values": [
+          "Q0"
+        ],
+        "relevance_values": [
+          0,
+          1
+        ],
+        "sample": [
+          {
+            "query_id": "0",
+            "iteration": "Q0",
+            "docid": "105156#0",
+            "relevance": 1
+          },
+          {
+            "query_id": "0",
+            "iteration": "Q0",
+            "docid": "36716#23",
+            "relevance": 1
+          },
+          {
+            "query_id": "0",
+            "iteration": "Q0",
+            "docid": "6949493#75",
+            "relevance": 1
+          }
+        ],
+        "source_url": "https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/qrels/qrels.miracl-v1.0-ru-dev.tsv"
+      }
+    }
+  }
+}

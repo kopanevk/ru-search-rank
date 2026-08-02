@@ -1,0 +1,8 @@
+{
+  "status": "BLOCKED_EXTERNAL_RUN",
+  "reason": "Full retrieval requires Linux, Python 3.12, Java 21 and Pyserini.",
+  "runner": "scripts/run_full_bm25_retrieval.ipynb",
+  "official_values": {},
+  "local_values": {},
+  "gate_passed": null
+}

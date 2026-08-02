@@ -1,0 +1,7 @@
+language: ru
+checkpoint: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+sample_size: 3
+max_length: 256
+candidate_top_k: 100
+official_retrieval_hits: 1000
+
