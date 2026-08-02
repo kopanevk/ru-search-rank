@@ -224,36 +224,159 @@ def build_qrels_split_audit(
 ) -> dict[str, object]:
     """Summarize one fully generated split for ``qrels_audit.json``."""
 
-    _require_columns(queries, {"query_id"}, "queries")
-    _require_columns(candidates, {"query_id", "judgment", "bm25_rank"}, "candidates")
+    _require_columns(queries, {"query_id", "query_text"}, "queries")
+    _require_columns(
+        candidates,
+        {"query_id", "docid", "judgment", "bm25_rank"},
+        "candidates",
+    )
     labels = _normalise_qrels(qrels)
-    query_ids = queries["query_id"].astype("string").drop_duplicates()
+    normalized_queries = queries[["query_id", "query_text"]].copy()
+    normalized_queries[["query_id", "query_text"]] = normalized_queries[
+        ["query_id", "query_text"]
+    ].astype("string")
+    if normalized_queries["query_id"].duplicated(keep=False).any():
+        raise ValueError("queries contain duplicate query_id values within a split")
+    query_ids = normalized_queries["query_id"]
+    unknown_qrels = sorted(set(labels["query_id"]).difference(query_ids))
+    if unknown_qrels:
+        raise ValueError(f"qrels contain unknown query_id values: {unknown_qrels[:10]}")
+    unknown_candidates = sorted(
+        set(candidates["query_id"].astype("string")).difference(query_ids)
+    )
+    if unknown_candidates:
+        raise ValueError(
+            f"candidates contain unknown query_id values: {unknown_candidates[:10]}"
+        )
     counts = labels.assign(
         positive=labels["relevance_grade"].gt(0),
         negative=labels["relevance_grade"].eq(0),
     ).groupby("query_id", sort=False)[["positive", "negative"]].sum()
     counts = counts.reindex(query_ids, fill_value=0)
-    candidate_queries = set(candidates["query_id"].astype("string"))
+    normalized_candidates = candidates[["query_id", "docid", "judgment", "bm25_rank"]].copy()
+    normalized_candidates[["query_id", "docid", "judgment"]] = normalized_candidates[
+        ["query_id", "docid", "judgment"]
+    ].astype("string")
+    if normalized_candidates.duplicated(["query_id", "docid"], keep=False).any():
+        raise ValueError("candidates contain duplicate (query_id, docid) pairs")
+    semantic_check = normalized_candidates.merge(
+        labels,
+        on=["query_id", "docid"],
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
+    expected_judgment = pd.Series(
+        "unjudged", index=semantic_check.index, dtype="string"
+    )
+    expected_judgment.loc[semantic_check["relevance_grade"].gt(0)] = "relevant"
+    expected_judgment.loc[
+        semantic_check["relevance_grade"].eq(0)
+    ] = "judged_non_relevant"
+    if not semantic_check["judgment"].reset_index(drop=True).equals(
+        expected_judgment.reset_index(drop=True)
+    ):
+        bad_rows = semantic_check.loc[
+            semantic_check["judgment"].ne(expected_judgment),
+            ["query_id", "docid", "judgment", "relevance_grade"],
+        ].head(10)
+        raise ValueError(
+            "candidate judgment semantics disagree with qrels: "
+            + str(bad_rows.to_dict(orient="records"))
+        )
+    candidate_queries = set(normalized_candidates["query_id"])
     retrieved_positive_pairs = candidates.loc[
         candidates["judgment"].astype("string").eq("relevant"), ["query_id", "docid"]
     ].drop_duplicates()
-    top10 = candidates.loc[pd.to_numeric(candidates["bm25_rank"]).le(10)]
-    judged_at_10 = float(top10["judgment"].astype("string").ne("unjudged").sum()) / (
-        10 * len(query_ids)
+    top10 = normalized_candidates.loc[
+        pd.to_numeric(normalized_candidates["bm25_rank"]).le(10)
+    ].copy()
+    top10["judged"] = top10["judgment"].ne("unjudged")
+    top10_per_query = top10.groupby("query_id", sort=False).agg(
+        retrieved_at_10=("docid", "size"),
+        judged_at_10=("judged", "sum"),
     )
+    candidate_per_query = normalized_candidates.assign(
+        judged=normalized_candidates["judgment"].ne("unjudged")
+    ).groupby("query_id", sort=False).agg(
+        candidate_count=("docid", "size"),
+        judged_candidate_count=("judged", "sum"),
+    )
+    coverage = normalized_queries.merge(
+        candidate_per_query,
+        left_on="query_id",
+        right_index=True,
+        how="left",
+        validate="one_to_one",
+    ).merge(
+        top10_per_query,
+        left_on="query_id",
+        right_index=True,
+        how="left",
+        validate="one_to_one",
+    )
+    numeric_columns = [
+        "candidate_count",
+        "judged_candidate_count",
+        "retrieved_at_10",
+        "judged_at_10",
+    ]
+    coverage[numeric_columns] = coverage[numeric_columns].fillna(0).astype("int64")
+    coverage["judged_fraction"] = np.where(
+        coverage["candidate_count"].gt(0),
+        coverage["judged_candidate_count"] / coverage["candidate_count"],
+        0.0,
+    )
+    coverage["judged_fraction_at_10"] = np.where(
+        coverage["retrieved_at_10"].gt(0),
+        coverage["judged_at_10"] / coverage["retrieved_at_10"],
+        0.0,
+    )
+    candidate_pairs = normalized_candidates[["query_id", "docid"]].drop_duplicates()
+    qrels_pairs = labels[["query_id", "docid"]]
+    judged_overlap = candidate_pairs.merge(
+        qrels_pairs,
+        on=["query_id", "docid"],
+        how="inner",
+        validate="one_to_one",
+    )
+    judgment_counts = {
+        state: int(normalized_candidates["judgment"].eq(state).sum())
+        for state in ("relevant", "judged_non_relevant", "unjudged")
+    }
+    zero_judged = coverage.loc[
+        coverage["judged_candidate_count"].eq(0), ["query_id", "query_text"]
+    ]
     return {
         "queries": int(len(query_ids)),
+        "unique_qrels_query_ids": int(labels["query_id"].nunique()),
         "qrels": int(len(labels)),
+        "unique_qrels_query_doc_pairs": int(
+            len(labels[["query_id", "docid"]].drop_duplicates())
+        ),
+        "relevance_values": sorted(
+            int(value) for value in labels["relevance_grade"].unique()
+        ),
         "relevant_judgments": int(labels["relevance_grade"].gt(0).sum()),
-        "non_relevant_judgments": int(labels["relevance_grade"].eq(0).sum()),
+        "judged_non_relevant_judgments": int(
+            labels["relevance_grade"].eq(0).sum()
+        ),
         "queries_without_known_positive": int(counts["positive"].eq(0).sum()),
         "positives_per_query": distribution_summary(counts["positive"]),
         "judged_negatives_per_query": distribution_summary(counts["negative"]),
         "fraction_queries_without_judged_negative": float(counts["negative"].eq(0).mean()),
-        "candidate_judgment_coverage": float(
-            candidates["judgment"].astype("string").ne("unjudged").mean()
+        "candidate_rows": int(len(normalized_candidates)),
+        "candidate_judgment_counts": judgment_counts,
+        "candidate_qrels_overlap_pairs": int(len(judged_overlap)),
+        "candidate_judgment_coverage": float(coverage["judged_fraction"].mean()),
+        "mean_judged_at_10": float(coverage["judged_fraction_at_10"].mean()),
+        "per_query_candidate_count": distribution_summary(coverage["candidate_count"]),
+        "per_query_judged_count": distribution_summary(
+            coverage["judged_candidate_count"]
         ),
-        "mean_judged_at_10": judged_at_10,
+        "zero_judged_query_count": int(len(zero_judged)),
+        "zero_judged_queries": zero_judged.to_dict(orient="records"),
+        "per_query_coverage": coverage.to_dict(orient="records"),
         "known_positives_retrieved_at_100": int(len(retrieved_positive_pairs)),
         "retrieval_failures": int(sum(query_id not in candidate_queries for query_id in query_ids)),
     }

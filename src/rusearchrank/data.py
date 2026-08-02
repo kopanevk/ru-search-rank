@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import ssl
 from typing import Any
@@ -32,13 +33,39 @@ CANDIDATE_COLUMNS = (
     "relevance",
     "is_judged",
 )
-JUDGMENTS = frozenset({"relevant", "non_relevant", "unjudged"})
+JUDGMENTS = frozenset({"relevant", "judged_non_relevant", "unjudged"})
 
 _MIRACL_ANNOTATIONS = "miracl/miracl"
 _MIRACL_CORPUS = "miracl/miracl-corpus"
 _HF_API = "https://huggingface.co/api/datasets"
 _HF_RESOLVE = "https://huggingface.co/datasets"
 _HF_ROWS = "https://datasets-server.huggingface.co/rows"
+
+
+class MissingCandidatePassagesError(ValueError):
+    """Candidate docids were absent from the revision-pinned corpus stream."""
+
+    def __init__(
+        self,
+        missing_docids: list[str],
+        *,
+        candidate_context: dict[str, list[dict[str, str]]] | None = None,
+    ) -> None:
+        self.missing_docids = list(missing_docids)
+        details: list[str] = []
+        for docid in self.missing_docids[:10]:
+            locations = (candidate_context or {}).get(docid, [])
+            location_text = ", ".join(
+                f"split={row.get('split')}, query_id={row.get('query_id')}"
+                for row in locations[:3]
+            )
+            details.append(
+                f"docid={docid}" + (f" ({location_text})" if location_text else "")
+            )
+        super().__init__(
+            f"{len(self.missing_docids)} candidate passages missing from corpus; "
+            "first entries: " + "; ".join(details)
+        )
 
 
 def _require_columns(frame: pd.DataFrame, required: set[str], label: str) -> None:
@@ -130,7 +157,7 @@ def validate_candidate_schema(candidates: pd.DataFrame) -> None:
         & bool_values.eq(True)
     )
     non_relevant = (
-        judgment.eq("non_relevant")
+        judgment.eq("judged_non_relevant")
         & grades.eq(0)
         & relevance.eq(0)
         & bool_values.eq(True)
@@ -223,7 +250,9 @@ def attach_qrels(candidates: pd.DataFrame, qrels: pd.DataFrame) -> pd.DataFrame:
     merged["is_judged"] = merged["relevance_grade"].notna().astype("bool")
     merged["judgment"] = pd.Series("unjudged", index=merged.index, dtype="string")
     merged.loc[merged["relevance_grade"].gt(0), "judgment"] = "relevant"
-    merged.loc[merged["relevance_grade"].eq(0), "judgment"] = "non_relevant"
+    merged.loc[
+        merged["relevance_grade"].eq(0), "judgment"
+    ] = "judged_non_relevant"
 
     ordered = list(CANDIDATE_COLUMNS) + [
         column for column in merged.columns if column not in CANDIDATE_COLUMNS
@@ -264,7 +293,10 @@ def validate_passages(passages: pd.DataFrame) -> None:
 
 
 def extract_passages_from_rows(
-    rows: Any, candidate_docids: set[str]
+    rows: Any,
+    candidate_docids: set[str],
+    *,
+    candidate_context: dict[str, list[dict[str, str]]] | None = None,
 ) -> pd.DataFrame:
     """Retain only requested passages from an iterable of official corpus rows."""
 
@@ -292,8 +324,10 @@ def extract_passages_from_rows(
 
     missing = sorted(requested.difference(found))
     if missing:
-        preview = ", ".join(missing[:10])
-        raise ValueError(f"candidate passages missing from corpus: {preview}")
+        raise MissingCandidatePassagesError(
+            missing,
+            candidate_context=candidate_context,
+        )
 
     passages = pd.DataFrame(
         [
@@ -312,6 +346,7 @@ def stream_candidate_passages(
     dataset_name: str,
     language: str,
     revision: str,
+    candidate_context: dict[str, list[dict[str, str]]] | None = None,
 ) -> pd.DataFrame:
     """Stream the official corpus and materialize only requested documents."""
 
@@ -327,7 +362,11 @@ def stream_candidate_passages(
         revision=revision,
         streaming=True,
     )
-    return extract_passages_from_rows(corpus, candidate_docids)
+    return extract_passages_from_rows(
+        corpus,
+        candidate_docids,
+        candidate_context=candidate_context,
+    )
 
 
 def read_candidate_table(path: str | Path) -> pd.DataFrame:
@@ -438,15 +477,25 @@ def download_annotation_files(
             raise ValueError(f"missing official annotation URL for split {split!r}")
         topics_path = destination / f"topics.miracl-v1.0-ru-{split}.tsv"
         qrels_path = destination / f"qrels.miracl-v1.0-ru-{split}.tsv"
+        pending: dict[Path, Path] = {}
         for url, path in ((topics_urls[split], topics_path), (qrels_urls[split], qrels_path)):
             if not path.is_file():
                 payload = _fetch_text(str(url), timeout)
-                temporary = path.with_suffix(path.suffix + ".tmp")
-                temporary.write_text(payload, encoding="utf-8")
-                temporary.replace(path)
+                temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+                if temporary.exists():
+                    raise RuntimeError(
+                        f"diagnostic annotation download already exists: {temporary}"
+                    )
+                with temporary.open("w", encoding="utf-8") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                pending[path] = temporary
 
-        topics = load_topics(topics_path, split=split)
-        qrels = load_qrels(qrels_path, split=split)
+        topics_source = pending.get(topics_path, topics_path)
+        qrels_source = pending.get(qrels_path, qrels_path)
+        topics = load_topics(topics_source, split=split)
+        qrels = load_qrels(qrels_source, split=split)
         expected_query_count = int(expected_rows[f"{split}_queries"])
         expected_qrels_count = int(expected_rows[f"{split}_qrels"])
         if len(topics) != expected_query_count or len(qrels) != expected_qrels_count:
@@ -459,6 +508,8 @@ def download_annotation_files(
             raise RuntimeError(f"official {split} qrels contain duplicate pairs")
         if (qrels["relevance_grade"] < 0).any():
             raise RuntimeError(f"official {split} qrels contain negative grades")
+        for final_path, temporary in pending.items():
+            temporary.replace(final_path)
         result[split] = {"topics": topics_path, "qrels": qrels_path}
     return result
 

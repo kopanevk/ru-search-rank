@@ -21,7 +21,7 @@ def valid_candidates() -> pd.DataFrame:
             "bm25_rank": [1, 2, 3],
             "bm25_score": [3.0, 2.0, 1.0],
             "relevance_grade": pd.Series([2, 0, pd.NA], dtype="Int64"),
-            "judgment": ["relevant", "non_relevant", "unjudged"],
+            "judgment": ["relevant", "judged_non_relevant", "unjudged"],
             "relevance": pd.Series([1, 0, pd.NA], dtype="Int64"),
             "is_judged": [True, True, False],
         }
@@ -38,8 +38,8 @@ def test_all_three_judgment_states_are_valid() -> None:
         (0, "relevant", 1, True),
         (1, "relevant", 0, True),
         (1, "relevant", 1, False),
-        (1, "non_relevant", 0, True),
-        (0, "non_relevant", 1, True),
+        (1, "judged_non_relevant", 0, True),
+        (0, "judged_non_relevant", 1, True),
         (pd.NA, "unjudged", 0, False),
         (pd.NA, "unjudged", pd.NA, True),
         (pd.NA, "unknown", pd.NA, False),
@@ -104,7 +104,11 @@ def test_attach_qrels_preserves_grade_and_three_states_without_row_growth() -> N
     result = attach_qrels(run, qrels)
     assert len(result) == len(run)
     assert result["relevance_grade"].tolist() == [2, 0, pd.NA]
-    assert result["judgment"].tolist() == ["relevant", "non_relevant", "unjudged"]
+    assert result["judgment"].tolist() == [
+        "relevant",
+        "judged_non_relevant",
+        "unjudged",
+    ]
     assert result["is_judged"].tolist() == [True, True, False]
     assert pd.isna(result.loc[2, "relevance"])
 

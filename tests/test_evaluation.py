@@ -9,6 +9,7 @@ import pytest
 
 import rusearchrank.cli as cli_module
 from rusearchrank.evaluation import (
+    build_qrels_split_audit,
     evaluate_bm25_metrics,
     parse_trec_eval_metric,
     reproduction_rows,
@@ -168,3 +169,41 @@ def test_duplicate_candidates_and_qrels_fail_loudly() -> None:
     duplicate_labels = qrels([("q", "d", 1), ("q", "d", 1)])
     with pytest.raises(ValueError, match="duplicate"):
         evaluate_bm25_metrics(ranking([("q", "d", 1)]), duplicate_labels)
+
+
+def test_qrels_audit_reports_three_states_per_query_and_zero_judged() -> None:
+    queries = pd.DataFrame(
+        {
+            "query_id": ["q1", "q2"],
+            "query_text": ["one", "two"],
+        }
+    )
+    labels = qrels([("q1", "positive", 1), ("q1", "negative", 0)])
+    candidates = pd.DataFrame(
+        {
+            "query_id": ["q1", "q1", "q1", "q2"],
+            "docid": ["positive", "negative", "unknown", "only-unjudged"],
+            "bm25_rank": [1, 2, 3, 1],
+            "judgment": [
+                "relevant",
+                "judged_non_relevant",
+                "unjudged",
+                "unjudged",
+            ],
+        }
+    )
+    report = build_qrels_split_audit(
+        queries=queries,
+        qrels=labels,
+        candidates=candidates,
+    )
+    assert report["unique_qrels_query_doc_pairs"] == 2
+    assert report["candidate_judgment_counts"] == {
+        "relevant": 1,
+        "judged_non_relevant": 1,
+        "unjudged": 2,
+    }
+    assert report["zero_judged_query_count"] == 1
+    assert report["zero_judged_queries"] == [
+        {"query_id": "q2", "query_text": "two"}
+    ]

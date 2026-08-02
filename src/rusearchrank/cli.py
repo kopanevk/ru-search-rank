@@ -12,9 +12,12 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from typing import Any, Sequence
 import zipfile
@@ -24,6 +27,7 @@ import yaml
 
 from .data import (
     CANDIDATE_COLUMNS,
+    MissingCandidatePassagesError,
     download_annotation_files,
     inspect_miracl_ru,
     load_qrels,
@@ -63,10 +67,23 @@ FULL_RETRIEVAL_ERROR = (
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    if temporary.exists():
+        raise RuntimeError(
+            f"diagnostic temporary JSON already exists and was preserved: {temporary}"
+        )
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _read_json(temporary)
+        temporary.replace(path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to write JSON atomically; diagnostic temporary file: {temporary}"
+        ) from exc
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -138,7 +155,9 @@ def _phase1_environment(config: dict[str, Any]) -> dict[str, Any]:
         pyserini_version = importlib.metadata.version("pyserini")
     except importlib.metadata.PackageNotFoundError:
         pyserini_version = None
-    disk = shutil.disk_usage(Path.cwd())
+    repository_root = _repository_root(config)
+    disk = shutil.disk_usage(repository_root)
+    java_home = os.environ.get("JAVA_HOME")
     return {
         "platform": platform.system(),
         "platform_detail": platform.platform(),
@@ -146,6 +165,10 @@ def _phase1_environment(config: dict[str, Any]) -> dict[str, Any]:
         "python_executable": sys.executable,
         "java": java,
         "java_major": _java_major_version(str(java.get("output", ""))),
+        "java_home": java_home,
+        "java_home_executable": (
+            str(Path(java_home) / "bin/java") if java_home else None
+        ),
         "pyserini": pyserini_version,
         "cpu_count": os.cpu_count(),
         "memory_bytes": _memory_bytes(),
@@ -160,26 +183,47 @@ def _require_external_environment(config: dict[str, Any]) -> dict[str, Any]:
     python_expected = tuple(int(part) for part in str(expected["python"]).split("."))
     python_ok = sys.version_info[:2] == python_expected
     java_ok = report["java_major"] == int(expected["java"])
+    java_home = report.get("java_home")
+    java_home_ok = bool(java_home) and (Path(str(java_home)) / "bin/java").is_file()
     pyserini_ok = report["pyserini"] == str(expected["pyserini"])
     disk_required = int(expected["minimum_free_disk_gib"]) * 1024**3
     disk_ok = int(report["disk_free_bytes"]) >= disk_required
-    if not (
-        platform.system() == "Linux"
-        and python_ok
-        and java_ok
-        and pyserini_ok
-        and disk_ok
-    ):
-        raise RuntimeError(FULL_RETRIEVAL_ERROR)
+    checks = {
+        "platform_linux": platform.system() == "Linux",
+        f"python_{expected['python']}": python_ok,
+        f"java_{expected['java']}": java_ok,
+        "java_home_bin_java": java_home_ok,
+        f"pyserini_{expected['pyserini']}": pyserini_ok,
+        f"free_disk_gib_at_least_{expected['minimum_free_disk_gib']}": disk_ok,
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(
+            FULL_RETRIEVAL_ERROR
+            + " Failed checks: "
+            + ", ".join(failed)
+            + ". Observed: "
+            + json.dumps(
+                {
+                    "platform": report["platform"],
+                    "python": report["python"],
+                    "java_major": report["java_major"],
+                    "java_home": report["java_home"],
+                    "pyserini": report["pyserini"],
+                    "disk_free_bytes": report["disk_free_bytes"],
+                },
+                ensure_ascii=False,
+            )
+        )
     return report
 
 
 def _artifact_path(config: dict[str, Any], key: str) -> Path:
-    return Path(str(config["artifacts"][key]))
+    return _resolve_repository_path(config, config["artifacts"][key])
 
 
 def _audit_path(config: dict[str, Any], key: str) -> Path:
-    return Path(str(config["audits"][key]))
+    return _resolve_repository_path(config, config["audits"][key])
 
 
 def _ensure_writable_targets(paths: Sequence[Path], *, overwrite: bool) -> None:
@@ -272,9 +316,24 @@ def _validate_train_topics(config: dict[str, Any]) -> tuple[pd.DataFrame, dict[s
 
 
 def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.to_parquet(temporary, index=False)
-    temporary.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    if temporary.exists():
+        raise RuntimeError(
+            f"diagnostic temporary Parquet already exists and was preserved: {temporary}"
+        )
+    try:
+        frame.to_parquet(temporary, index=False)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        reloaded = pd.read_parquet(temporary)
+        if len(reloaded) != len(frame) or list(reloaded.columns) != list(frame.columns):
+            raise ValueError("temporary Parquet row count or schema changed during write")
+        temporary.replace(path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to write Parquet atomically; diagnostic temporary file: {temporary}"
+        ) from exc
 
 
 def _sha256(path: Path) -> str:
@@ -307,6 +366,75 @@ def _run_capture(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
         "returncode": result.returncode,
         "output": output,
     }
+
+
+def _run_streaming_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+) -> dict[str, Any]:
+    """Stream both pipes live and persist their complete contents and return code."""
+
+    print("+", shlex.join(command), flush=True)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        payload = {
+            "command": command,
+            "cwd": str(cwd),
+            "returncode": None,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        _write_json(log_path, payload)
+        raise RuntimeError(
+            f"failed to start command; complete log: {log_path}: {exc}"
+        ) from exc
+
+    def pump(stream: Any, destination: Any, collected: list[str]) -> None:
+        for line in iter(stream.readline, ""):
+            collected.append(line)
+            print(line, end="", file=destination, flush=True)
+        stream.close()
+
+    threads = [
+        threading.Thread(
+            target=pump,
+            args=(process.stdout, sys.stdout, stdout_lines),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=pump,
+            args=(process.stderr, sys.stderr, stderr_lines),
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    returncode = process.wait()
+    for thread in threads:
+        thread.join()
+    payload = {
+        "command": command,
+        "cwd": str(cwd),
+        "returncode": returncode,
+        "stdout": "".join(stdout_lines),
+        "stderr": "".join(stderr_lines),
+    }
+    _write_json(log_path, payload)
+    return payload
 
 
 def _memory_bytes() -> int | None:
@@ -712,6 +840,280 @@ def _prepare_annotations(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_retrieval_config_contract(config: dict[str, Any]) -> dict[str, Any]:
+    required_nested = {
+        "dataset": {
+            "name",
+            "language",
+            "corpus_source",
+            "corpus_revision",
+            "annotations_revision",
+            "train_topics_path",
+            "topics",
+            "qrels",
+            "expected_rows",
+        },
+        "environment": {
+            "python",
+            "java",
+            "pyserini",
+            "minimum_free_disk_gib",
+        },
+        "retrieval": {
+            "engine",
+            "index_name",
+            "candidate_depth",
+            "retrieval_hits",
+            "threads",
+            "batch_size",
+            "bm25_k1",
+            "bm25_b",
+        },
+        "artifacts": {
+            "train_run",
+            "dev_run",
+            "dev_top100_run",
+            "train_candidates",
+            "dev_candidates",
+            "queries",
+            "passages",
+        },
+        "audits": {"reproduction", "qrels", "manifest"},
+        "reproduction_gate": {
+            "trec_eval_executable",
+            "trec_eval_version",
+            "official_topic",
+            "official_ndcg_at_10",
+            "official_recall_at_100",
+            "ndcg_at_10_tolerance",
+            "recall_at_100_tolerance",
+        },
+        "archive": {"path", "include_runs"},
+        "paths": {"repository_root", "raw_dir", "work_dir"},
+    }
+    for section, required_keys in required_nested.items():
+        value = config.get(section)
+        if not isinstance(value, dict):
+            raise ValueError(f"retrieval config section {section!r} must be a mapping")
+        missing = sorted(required_keys.difference(value))
+        if missing:
+            raise ValueError(
+                f"retrieval config section {section!r} is missing: {', '.join(missing)}"
+            )
+    if config.get("splits") != ["train", "dev"]:
+        raise ValueError("retrieval config splits must be [train, dev]")
+    for name in ("topics", "qrels"):
+        if set(config["dataset"][name]) != {"train", "dev"}:
+            raise ValueError(f"dataset.{name} must contain exactly train and dev")
+    expected_row_keys = {
+        "train_queries",
+        "dev_queries",
+        "train_qrels",
+        "dev_qrels",
+    }
+    if set(config["dataset"]["expected_rows"]) != expected_row_keys:
+        raise ValueError("dataset.expected_rows has an unexpected key set")
+    if any(
+        int(config["dataset"]["expected_rows"][key]) <= 0
+        for key in expected_row_keys
+    ):
+        raise ValueError("all dataset.expected_rows values must be positive")
+    root = _repository_root(config)
+    if not root.is_dir():
+        raise ValueError(f"configured repository root does not exist: {root}")
+    expected_hits = config["retrieval"].get("retrieval_hits")
+    if expected_hits != {"train": 100, "dev": 1000}:
+        raise ValueError(
+            "retrieval_hits must preserve train=100 and official dev=1000"
+        )
+    if int(config["retrieval"].get("candidate_depth", 0)) != 100:
+        raise ValueError("candidate_depth must be 100")
+    if config["retrieval"].get("index_name") != "miracl-v1.0-ru":
+        raise ValueError("official index_name must be miracl-v1.0-ru")
+    if config["reproduction_gate"].get("official_topic") != "miracl-v1.0-ru-dev":
+        raise ValueError("official dev topic ID must be miracl-v1.0-ru-dev")
+
+    configured_paths: list[Path] = []
+    configured_paths.extend(_artifact_path(config, key) for key in config["artifacts"])
+    configured_paths.extend(_audit_path(config, key) for key in config["audits"])
+    configured_paths.append(_resolve_repository_path(config, config["archive"]["path"]))
+    for path in configured_paths:
+        _portable_repository_path(config, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=".rusearchrank-write-probe-",
+                delete=True,
+            ) as probe:
+                probe.write(b"ok")
+                probe.flush()
+        except OSError as exc:
+            raise ValueError(f"output directory is not writable: {path.parent}") from exc
+    return {
+        "repository_root": str(root),
+        "config": _portable_repository_path(config, Path(config["_config_path"])),
+        "output_directories": sorted({str(path.parent) for path in configured_paths}),
+    }
+
+
+def _validate_official_annotations(
+    config: dict[str, Any],
+) -> tuple[dict[str, dict[str, Path]], dict[str, Any]]:
+    paths = _expected_annotation_paths(config)
+    report: dict[str, Any] = {}
+    for split in ("train", "dev"):
+        topics_path = paths[split]["topics"]
+        qrels_path = paths[split]["qrels"]
+        _require_nonempty_regular_file(topics_path, label=f"official {split} topics")
+        _require_nonempty_regular_file(qrels_path, label=f"official {split} qrels")
+        topics = load_topics(topics_path, split=split)
+        qrels = load_qrels(qrels_path, split=split)
+        expected_topics = int(config["dataset"]["expected_rows"][f"{split}_queries"])
+        expected_qrels = int(config["dataset"]["expected_rows"][f"{split}_qrels"])
+        if len(topics) != expected_topics:
+            raise ValueError(
+                f"official {split} topics have {len(topics)} rows; expected {expected_topics}"
+            )
+        if len(qrels) != expected_qrels:
+            raise ValueError(
+                f"official {split} qrels have {len(qrels)} rows; expected {expected_qrels}"
+            )
+        if qrels[["split", "query_id", "docid"]].astype("string").duplicated().any():
+            raise ValueError(f"official {split} qrels contain duplicate query-doc pairs")
+        if set(qrels["relevance_grade"].astype("int64")) - {0, 1}:
+            raise ValueError(
+                f"official {split} qrels contain unsupported relevance values"
+            )
+        report[split] = {
+            "topics": _file_metadata(config, topics_path),
+            "qrels": _file_metadata(config, qrels_path),
+            "query_count": len(topics),
+            "qrels_count": len(qrels),
+        }
+    _, train_topics = _validate_train_topics(config)
+    report["train_topics_contract"] = train_topics
+    report["dev_registered_topic"] = config["reproduction_gate"]["official_topic"]
+    return paths, report
+
+
+def _preflight_retrieval(
+    config: dict[str, Any], *, check_index: bool
+) -> dict[str, Any]:
+    config_report = _validate_retrieval_config_contract(config)
+    environment = _require_external_environment(config)
+    if importlib.util.find_spec("pyserini") is None:
+        raise ValueError("Pyserini cannot be imported from the active Python environment")
+    try:
+        from pyserini.search import get_topics
+
+        registered_dev_topics = get_topics(
+            str(config["reproduction_gate"]["official_topic"])
+        )
+    except (ImportError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Pyserini cannot resolve the registered official dev topics "
+            f"{config['reproduction_gate']['official_topic']!r}"
+        ) from exc
+    expected_dev_queries = int(config["dataset"]["expected_rows"]["dev_queries"])
+    if not registered_dev_topics or len(registered_dev_topics) != expected_dev_queries:
+        raise ValueError(
+            "registered official dev topics have an unexpected query count: "
+            f"{len(registered_dev_topics) if registered_dev_topics else 0}; "
+            f"expected {expected_dev_queries}"
+        )
+    trec_eval = _resolve_trec_eval_executable(config)
+    trec_eval_probe = _probe_trec_eval(trec_eval)
+    _, annotations = _validate_official_annotations(config)
+    report: dict[str, Any] = {
+        "stage": "retrieval",
+        "config": config_report,
+        "environment": environment,
+        "trec_eval": {
+            "path": str(trec_eval),
+            "expected_version": str(config["reproduction_gate"]["trec_eval_version"]),
+            "probe": trec_eval_probe,
+        },
+        "annotations": annotations,
+        "registered_dev_topics": {
+            "id": config["reproduction_gate"]["official_topic"],
+            "query_count": len(registered_dev_topics),
+        },
+        "index_name": config["retrieval"]["index_name"],
+        "index_checked": check_index,
+    }
+    if check_index:
+        report["index_smoke"] = smoke_prebuilt_index(
+            index_name=str(config["retrieval"]["index_name"]),
+            language=str(config["dataset"]["language"]),
+            query_text="Когда начался Карибский кризис?",
+        )
+    return report
+
+
+def _preflight_candidate_cache(config: dict[str, Any]) -> dict[str, Any]:
+    retrieval_report = _preflight_retrieval(config, check_index=False)
+    paths, _ = _validate_official_annotations(config)
+    run_reports: dict[str, Any] = {}
+    for split, key in (("train", "train_run"), ("dev", "dev_run")):
+        run_path = _artifact_path(config, key)
+        topics = load_topics(paths[split]["topics"], split=split)
+        requested_top_k = int(config["retrieval"]["retrieval_hits"][split])
+        raw, normalized, depth = _validate_retrieval_run(
+            run_path,
+            split=split,
+            queries=topics,
+            requested_top_k=requested_top_k,
+        )
+        _require_no_zero_hits(
+            depth,
+            context=f"candidate-cache preflight rejected {split} run",
+        )
+        validate_query_coverage(normalized, topics)
+        run_reports[split] = {
+            **_file_metadata(config, run_path),
+            "rows": len(raw),
+            "retrieval_depth": depth,
+        }
+    reproduction, audit_path, dev_hash = _require_reproduction_gate(config)
+    return {
+        "stage": "candidate-cache",
+        "retrieval_preflight": retrieval_report,
+        "runs": run_reports,
+        "reproduction": {
+            "path": _portable_repository_path(config, audit_path),
+            "status": reproduction["status"],
+            "overall_pass": reproduction["overall_pass"],
+            "dev_top1000_sha256": dev_hash,
+        },
+    }
+
+
+def _preflight_command(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    if args.stage == "retrieval":
+        report = _preflight_retrieval(config, check_index=args.check_index)
+    elif args.stage == "candidate-cache":
+        if args.check_index:
+            raise ValueError("--check-index is only valid for retrieval preflight")
+        report = _preflight_candidate_cache(config)
+    else:
+        if args.check_index:
+            raise ValueError("--check-index is only valid for retrieval preflight")
+        report = _preflight_candidate_cache(config)
+        report["stage"] = "package"
+        for key in ("train_candidates", "dev_candidates", "queries", "passages"):
+            _require_nonempty_regular_file(
+                _artifact_path(config, key), label=f"package input {key}"
+            )
+        for key in ("qrels",):
+            _require_nonempty_regular_file(
+                _audit_path(config, key), label=f"package audit {key}"
+            )
+    _print_json({"status": "PASS", "preflight": report})
+    return 0
+
+
 def _inspect_linux_environment(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
     report = _phase1_environment(config)
@@ -799,16 +1201,100 @@ def _validate_raw_trec_depth(
     validate_top_k(source_ranked, requested_top_k, require_exact=False)
 
 
+def _validate_retrieval_run(
+    path: Path,
+    *,
+    split: str,
+    queries: pd.DataFrame,
+    requested_top_k: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    raw_run = read_trec_run(str(path), split=split)
+    _validate_raw_trec_depth(raw_run, requested_top_k=requested_top_k)
+    normalized = normalize_bm25_run(
+        raw_run[["split", "query_id", "docid", "bm25_score"]]
+    )
+    depth_audit = build_retrieval_depth_audit(
+        normalized,
+        queries,
+        requested_top_k=requested_top_k,
+    )
+    return raw_run, normalized, depth_audit
+
+
+_RUN_CORE_COLUMNS = ["split", "query_id", "docid", "bm25_rank", "bm25_score"]
+
+
+def _ranked_raw_trec(raw_run: pd.DataFrame) -> pd.DataFrame:
+    ranked = raw_run.rename(columns={"source_rank": "bm25_rank"})[
+        _RUN_CORE_COLUMNS
+    ].copy()
+    for column in ("split", "query_id", "docid"):
+        ranked[column] = ranked[column].astype("string")
+    ranked["bm25_rank"] = ranked["bm25_rank"].astype("int64")
+    ranked["bm25_score"] = ranked["bm25_score"].astype("float64")
+    return ranked
+
+
+def _expected_stable_truncation(
+    source: Path,
+    *,
+    split: str,
+    top_k: int,
+    source_top_k: int | None,
+) -> pd.DataFrame:
+    raw = read_trec_run(str(source), split=split)
+    raw_limit = source_top_k or int(pd.to_numeric(raw["source_rank"]).max())
+    _validate_raw_trec_depth(raw, requested_top_k=raw_limit)
+    expected = normalize_bm25_run(
+        raw[["split", "query_id", "docid", "bm25_score"]],
+        top_k=top_k,
+    )
+    validate_top_k(expected, top_k, require_exact=False)
+    validate_stable_order(expected)
+    return expected
+
+
+def _validate_stable_trec_derivation(
+    source: Path,
+    target: Path,
+    *,
+    split: str,
+    top_k: int,
+    source_top_k: int | None = None,
+) -> pd.DataFrame:
+    """Prove that ``target`` is the deterministic top-k derived from ``source``."""
+
+    expected = _expected_stable_truncation(
+        source,
+        split=split,
+        top_k=top_k,
+        source_top_k=source_top_k,
+    )
+    raw_target = read_trec_run(str(target), split=split)
+    _validate_raw_trec_depth(raw_target, requested_top_k=top_k)
+    actual = _ranked_raw_trec(raw_target)
+    validate_top_k(actual, top_k, require_exact=False)
+    validate_stable_order(actual)
+    expected_core = expected[_RUN_CORE_COLUMNS].reset_index(drop=True).copy()
+    expected_core["bm25_score"] = expected_core["bm25_score"].map(
+        lambda value: float(f"{float(value):.8f}")
+    )
+    if not expected_core.equals(actual[_RUN_CORE_COLUMNS].reset_index(drop=True)):
+        raise ValueError(
+            f"{target} is not the stable score-desc/docid-asc top-{top_k} "
+            f"derivation of {source}"
+        )
+    return actual
+
+
 def _run_bm25(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
-    _require_external_environment(config)
+    _preflight_retrieval(config, check_index=False)
     splits = list(config["splits"]) if args.split == "all" else [args.split]
     run_keys = {"train": "train_run", "dev": "dev_run"}
-    targets = [
-        _resolve_repository_path(config, config["artifacts"][run_keys[split]])
-        for split in splits
-    ]
-    _ensure_writable_targets(targets, overwrite=args.overwrite)
+    targets = [_artifact_path(config, run_keys[split]) for split in splits]
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
     annotation_paths = _expected_annotation_paths(config)
 
     results: dict[str, Any] = {}
@@ -827,46 +1313,114 @@ def _run_bm25(args: argparse.Namespace) -> int:
                 )
             topics_argument = _retrieval_topics_argument(config, split)
         retrieval_hits = int(config["retrieval"]["retrieval_hits"][split])
-        temporary = target.with_suffix(target.suffix + ".tmp")
-        command = _build_bm25_command(
-            config,
-            split=split,
-            target=temporary,
-            topics_argument=topics_argument,
-        )
-        started = time.perf_counter()
-        result = subprocess.run(
-            command,
-            cwd=_repository_root(config),
-            env=os.environ.copy(),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            temporary.unlink(missing_ok=True)
-            output = "\n".join(
-                part.strip() for part in (result.stdout, result.stderr) if part.strip()
-            )
-            raise RuntimeError(f"official Pyserini retrieval failed: {output}")
-        elapsed = time.perf_counter() - started
-        if not temporary.is_file():
-            raise RuntimeError("official Pyserini retrieval did not create its run file")
         work_path = _resolve_repository_path(
             config, config["paths"]["work_dir"]
         ) / f"retrieval_{split}.json"
+        command_target = target.with_suffix(target.suffix + ".tmp")
+        command = _build_bm25_command(
+            config,
+            split=split,
+            target=command_target,
+            topics_argument=topics_argument,
+        )
+        if target.exists() and not args.overwrite:
+            try:
+                raw_run, normalized, depth_audit = _validate_retrieval_run(
+                    target,
+                    split=split,
+                    queries=queries,
+                    requested_top_k=retrieval_hits,
+                )
+            except (ValueError, RuntimeError, OSError) as exc:
+                raise ValueError(
+                    f"existing {split} run is invalid and was preserved at "
+                    f"{_portable_repository_path(config, target)}. Review it, then use "
+                    f"--overwrite to rerun retrieval. Validation error: {exc}"
+                ) from exc
+            zero_hit_ids = _zero_hit_query_ids(depth_audit)
+            if zero_hit_ids:
+                _write_json(
+                    work_path,
+                    {
+                        "status": "FAIL_ZERO_HIT_QUERIES",
+                        "action": "rejected_existing_run",
+                        "split": split,
+                        "run": _portable_repository_path(config, target),
+                        "run_sha256": _sha256(target),
+                        "depth_audit": depth_audit,
+                    },
+                )
+                raise ValueError(
+                    f"existing {split} run contains zero-hit query_id values: "
+                    + ", ".join(zero_hit_ids)
+                    + f". Run preserved at {_portable_repository_path(config, target)}"
+                )
+            validate_query_coverage(normalized, queries)
+            run_report = {
+                "status": "PASS",
+                "action": "reused_valid_run",
+                "split": split,
+                "seconds": 0.0,
+                "queries": int(len(queries)),
+                "rows": int(len(raw_run)),
+                "hits_per_query": retrieval_hits,
+                "topics_argument": topics_argument,
+                "train_topics": train_topics_metadata,
+                "command_if_rebuilt": command,
+                "run": _portable_repository_path(config, target),
+                "run_sha256": _sha256(target),
+                "run_size_bytes": target.stat().st_size,
+                "raw_validation_path": None,
+                "depth_audit": depth_audit,
+            }
+            _write_json(work_path, run_report)
+            results[split] = {
+                "action": "reused_valid_run",
+                "run": _portable_repository_path(config, target),
+                "queries": int(len(queries)),
+                "rows": int(len(raw_run)),
+                "hits_per_query": retrieval_hits,
+                "seconds": 0.0,
+                "depth_audit": depth_audit,
+            }
+            continue
+
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        if temporary.exists():
+            raise ValueError(
+                f"diagnostic temporary run already exists: "
+                f"{_portable_repository_path(config, temporary)}. Preserve or move it "
+                "before starting a new retrieval."
+            )
+        started = time.perf_counter()
+        log_path = _resolve_repository_path(
+            config, config["paths"]["work_dir"]
+        ) / f"retrieval_{split}_command.json"
+        result = _run_streaming_process(
+            command,
+            cwd=_repository_root(config),
+            env=os.environ.copy(),
+            log_path=log_path,
+        )
+        if result["returncode"] != 0:
+            preserved = (
+                _portable_repository_path(config, temporary)
+                if temporary.exists()
+                else "not created"
+            )
+            raise RuntimeError(
+                "official Pyserini retrieval failed with return code "
+                f"{result['returncode']}; complete log: "
+                f"{_portable_repository_path(config, log_path)}; temporary run: {preserved}"
+            )
+        elapsed = time.perf_counter() - started
+        if not temporary.is_file():
+            raise RuntimeError("official Pyserini retrieval did not create its run file")
         try:
-            raw_run = read_trec_run(str(temporary), split=split)
-            _validate_raw_trec_depth(
-                raw_run,
-                requested_top_k=retrieval_hits,
-            )
-            validated = normalize_bm25_run(
-                raw_run[["split", "query_id", "docid", "bm25_score"]]
-            )
-            depth_audit = build_retrieval_depth_audit(
-                validated,
-                queries,
+            raw_run, validated, depth_audit = _validate_retrieval_run(
+                temporary,
+                split=split,
+                queries=queries,
                 requested_top_k=retrieval_hits,
             )
         except (ValueError, RuntimeError) as exc:
@@ -893,18 +1447,25 @@ def _run_bm25(args: argparse.Namespace) -> int:
             run_report["status"] = "FAIL_ZERO_HIT_QUERIES"
             _write_json(work_path, run_report)
             raise ValueError(
-                "BM25 run contains zero-hit queries: "
+                "BM25 run contains zero-hit query_id values: "
                 + ", ".join(zero_hit_ids)
                 + ". Raw run preserved at "
                 + _portable_repository_path(config, temporary)
             )
         validate_query_coverage(validated, queries)
         # Preserve Pyserini's raw output byte-for-byte for official evaluation.
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
         temporary.replace(target)
         run_report["status"] = "PASS"
+        run_report["action"] = "retrieved"
+        run_report["run_sha256"] = _sha256(target)
+        run_report["run_size_bytes"] = target.stat().st_size
+        run_report["command_log"] = _portable_repository_path(config, log_path)
         run_report["raw_validation_path"] = None
         _write_json(work_path, run_report)
         results[split] = {
+            "action": "retrieved",
             "run": _portable_repository_path(config, target),
             "queries": int(len(queries)),
             "rows": int(len(raw_run)),
@@ -926,79 +1487,295 @@ def _stable_truncate_trec_run(
 ) -> pd.DataFrame:
     """Write a separate deterministic top-k run without mutating its source."""
 
+    _require_nonempty_regular_file(source, label=f"source {split} TREC run")
     source_hash = _sha256(source)
-    raw = read_trec_run(str(source), split=split)
-    raw_limit = source_top_k or int(pd.to_numeric(raw["source_rank"]).max())
-    _validate_raw_trec_depth(raw, requested_top_k=raw_limit)
-    normalized = normalize_bm25_run(
-        raw[["split", "query_id", "docid", "bm25_score"]],
+    normalized = _expected_stable_truncation(
+        source,
+        split=split,
         top_k=top_k,
+        source_top_k=source_top_k,
     )
-    validate_top_k(normalized, top_k, require_exact=False)
-    validate_stable_order(normalized)
-    temporary = target.with_suffix(target.suffix + ".tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+    if temporary.exists():
+        raise RuntimeError(
+            f"diagnostic temporary TREC run already exists and was preserved: {temporary}"
+        )
     write_trec_run(
         normalized,
         str(temporary),
         tag="rusearchrank-stable-top100",
     )
-    if _sha256(source) != source_hash:
-        temporary.unlink(missing_ok=True)
-        raise RuntimeError("source dev top-1000 run changed during stable truncation")
-    temporary.replace(target)
-    # Candidate scores and ranks come from the exact portable top-k file.
-    portable = read_trec_run(str(target), split=split)
-    portable = normalize_bm25_run(
-        portable[["split", "query_id", "docid", "bm25_score"]],
+    with temporary.open("rb") as stream:
+        os.fsync(stream.fileno())
+    portable = _validate_stable_trec_derivation(
+        source,
+        temporary,
+        split=split,
         top_k=top_k,
+        source_top_k=source_top_k,
     )
-    validate_top_k(portable, top_k, require_exact=False)
-    validate_stable_order(portable)
+    if _sha256(source) != source_hash:
+        raise RuntimeError(
+            "source dev top-1000 run changed during stable truncation; "
+            f"diagnostic temporary file preserved at {temporary}"
+        )
+    temporary.replace(target)
     return portable
+
+
+def _load_or_create_stable_trec_run(
+    source: Path,
+    target: Path,
+    *,
+    split: str,
+    top_k: int,
+    source_top_k: int,
+    overwrite: bool,
+) -> tuple[pd.DataFrame, str]:
+    """Reuse a proven derived run, or create it without touching the raw source."""
+
+    existed_before = target.exists()
+    if existed_before:
+        try:
+            validated = _validate_stable_trec_derivation(
+                source,
+                target,
+                split=split,
+                top_k=top_k,
+                source_top_k=source_top_k,
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            if not overwrite:
+                raise ValueError(
+                    f"existing derived run is invalid or stale and was preserved: {target}. "
+                    "Use --overwrite only after reviewing it. "
+                    f"Validation error: {exc}"
+                ) from exc
+        else:
+            return validated, "reused_valid"
+    created = _stable_truncate_trec_run(
+        source,
+        target,
+        split=split,
+        top_k=top_k,
+        source_top_k=source_top_k,
+    )
+    return created, "recreated" if existed_before else "created"
+
+
+def _file_metadata(config: dict[str, Any], path: Path) -> dict[str, Any]:
+    _require_nonempty_regular_file(path, label="provenance input")
+    return {
+        "path": _portable_repository_path(config, path),
+        "size_bytes": path.stat().st_size,
+        "sha256": _sha256(path),
+    }
+
+
+def _require_reproduction_gate(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], Path, str]:
+    audit_path = _audit_path(config, "reproduction")
+    reproduction = _read_json(audit_path)
+    if (
+        reproduction.get("status") != "PASS"
+        or reproduction.get("gate_passed") is not True
+        or reproduction.get("overall_pass") is not True
+    ):
+        raise ValueError(
+            "candidate cache requires status=PASS and overall_pass=true in the "
+            "official dev reproduction audit"
+        )
+    dev_run_path = _artifact_path(config, "dev_run")
+    _require_nonempty_regular_file(
+        dev_run_path, label="untouched official dev top-1000 run"
+    )
+    portable_dev_run = _portable_repository_path(config, dev_run_path)
+    if reproduction.get("source_run") != portable_dev_run:
+        raise ValueError(
+            "candidate cache requires an audit of the configured dev top-1000 run"
+        )
+    current_hash = _sha256(dev_run_path)
+    if reproduction.get("source_run_sha256") != current_hash:
+        raise ValueError(
+            "candidate cache requires a reproduction gate for the current dev run; "
+            "the top-1000 SHA-256 changed after evaluation"
+        )
+    if reproduction.get("source_run_size_bytes") != dev_run_path.stat().st_size:
+        raise ValueError(
+            "candidate cache requires a reproduction audit with the current dev run size"
+        )
+    return reproduction, audit_path, current_hash
+
+
+def _candidate_output_paths(config: dict[str, Any]) -> dict[str, Path]:
+    return {
+        "train_candidates": _artifact_path(config, "train_candidates"),
+        "dev_candidates": _artifact_path(config, "dev_candidates"),
+        "queries": _artifact_path(config, "queries"),
+        "passages": _artifact_path(config, "passages"),
+    }
+
+
+def _candidate_input_metadata(
+    config: dict[str, Any],
+    annotation_paths: dict[str, dict[str, Path]],
+    *,
+    reproduction_path: Path,
+    dev_top100_path: Path,
+) -> dict[str, dict[str, Any]]:
+    paths = {
+        "train_run": _artifact_path(config, "train_run"),
+        "dev_top1000_run": _artifact_path(config, "dev_run"),
+        "dev_top100_run": dev_top100_path,
+        "reproduction_audit": reproduction_path,
+        "train_topics": annotation_paths["train"]["topics"],
+        "dev_topics": annotation_paths["dev"]["topics"],
+        "train_qrels": annotation_paths["train"]["qrels"],
+        "dev_qrels": annotation_paths["dev"]["qrels"],
+    }
+    return {name: _file_metadata(config, path) for name, path in paths.items()}
+
+
+def _candidate_locations(
+    candidate_frames: dict[str, pd.DataFrame],
+    *,
+    only_docids: set[str] | None = None,
+) -> dict[str, list[dict[str, str]]]:
+    context: dict[str, list[dict[str, str]]] = {}
+    for frame in candidate_frames.values():
+        for row in frame[["split", "query_id", "docid"]].itertuples(index=False):
+            docid = str(row.docid)
+            if only_docids is not None and docid not in only_docids:
+                continue
+            locations = context.setdefault(docid, [])
+            if len(locations) < 3:
+                locations.append(
+                    {"split": str(row.split), "query_id": str(row.query_id)}
+                )
+    return context
+
+
+def _validate_candidate_cache_artifacts(
+    config: dict[str, Any],
+    *,
+    dev_top100: pd.DataFrame,
+    expected_inputs: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    outputs = _candidate_output_paths(config)
+    candidates = {
+        split: read_candidate_table(outputs[f"{split}_candidates"])
+        for split in ("train", "dev")
+    }
+    top_k = int(config["retrieval"]["candidate_depth"])
+    for split, frame in candidates.items():
+        validate_candidate_schema(frame)
+        validate_top_k(frame, top_k, require_exact=False)
+        validate_stable_order(frame)
+        if set(frame["split"].astype("string")) != {split}:
+            raise ValueError(f"{split} candidate Parquet contains another split")
+    queries = pd.read_parquet(outputs["queries"])
+    passages = pd.read_parquet(outputs["passages"])
+    validate_queries(queries)
+    validate_passages(passages)
+    for split, frame in candidates.items():
+        expected_queries = queries.loc[queries["split"].astype("string").eq(split)]
+        validate_query_coverage(frame, expected_queries)
+    all_docids = set(
+        pd.concat([frame["docid"] for frame in candidates.values()]).astype("string")
+    )
+    passage_docids = set(passages["docid"].astype("string"))
+    if all_docids != passage_docids:
+        missing = sorted(all_docids.difference(passage_docids))
+        extra = sorted(passage_docids.difference(all_docids))
+        raise ValueError(
+            "passages.parquet does not exactly cover candidate docids: "
+            f"missing={missing[:10]}, extra={extra[:10]}"
+        )
+    actual_dev = candidates["dev"][_RUN_CORE_COLUMNS].reset_index(drop=True).copy()
+    expected_dev = dev_top100[_RUN_CORE_COLUMNS].reset_index(drop=True).copy()
+    for frame in (actual_dev, expected_dev):
+        for column in ("split", "query_id", "docid"):
+            frame[column] = frame[column].astype("string")
+        frame["bm25_rank"] = frame["bm25_rank"].astype("int64")
+        frame["bm25_score"] = frame["bm25_score"].astype("float64")
+    if not actual_dev.equals(expected_dev):
+        raise ValueError("dev candidate cache does not match the stable dev top-100 run")
+
+    work_path = _resolve_repository_path(
+        config, config["paths"]["work_dir"]
+    ) / "candidate_cache.json"
+    work = _read_json(work_path)
+    if expected_inputs is not None and work.get("input_artifacts") != expected_inputs:
+        raise ValueError("candidate cache provenance is stale or does not match its inputs")
+    expected_outputs = {
+        name: _file_metadata(config, path) for name, path in outputs.items()
+    }
+    if work.get("output_artifacts") != expected_outputs:
+        raise ValueError("candidate cache output hashes do not match its provenance audit")
+    return {
+        "candidates": candidates,
+        "queries": queries,
+        "passages": passages,
+        "work": work,
+    }
 
 
 def _build_candidate_cache(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
-    _require_external_environment(config)
-    reproduction = _read_json(_audit_path(config, "reproduction"))
-    if reproduction.get("status") != "PASS" or reproduction.get("gate_passed") is not True:
-        raise ValueError(
-            "candidate cache requires a passed official dev reproduction gate"
-        )
+    _preflight_candidate_cache(config)
+    _, reproduction_path, dev_source_hash = _require_reproduction_gate(config)
     dev_run_path = _artifact_path(config, "dev_run")
-    if reproduction.get("source_run") != str(dev_run_path):
-        raise ValueError(
-            "candidate cache requires an audit of the configured dev top-1000 run"
-        )
-    if reproduction.get("source_run_sha256") != _sha256(dev_run_path):
-        raise ValueError(
-            "candidate cache requires a reproduction gate for the current dev run"
-        )
-    dev_source_hash = _sha256(dev_run_path)
     dev_top100_path = _artifact_path(config, "dev_top100_run")
-    train_candidates_path = _artifact_path(config, "train_candidates")
-    dev_candidates_path = _artifact_path(config, "dev_candidates")
-    queries_path = _artifact_path(config, "queries")
-    passages_path = _artifact_path(config, "passages")
-    output_paths = [
-        dev_top100_path,
-        train_candidates_path,
-        dev_candidates_path,
-        queries_path,
-        passages_path,
-    ]
-    _ensure_writable_targets(output_paths, overwrite=args.overwrite)
     annotation_paths = _annotation_paths(config)
     top_k = int(config["retrieval"]["candidate_depth"])
-    dev_top100 = _stable_truncate_trec_run(
+    dev_top100, dev_top100_action = _load_or_create_stable_trec_run(
         dev_run_path,
         dev_top100_path,
         split="dev",
         top_k=top_k,
         source_top_k=int(config["retrieval"]["retrieval_hits"]["dev"]),
+        overwrite=args.overwrite,
     )
     if _sha256(dev_run_path) != dev_source_hash:
         raise RuntimeError("dev top-1000 run was modified after reproduction")
+
+    output_paths = _candidate_output_paths(config)
+    existing = {name for name, path in output_paths.items() if path.exists()}
+    if existing and existing != set(output_paths) and not args.overwrite:
+        missing = sorted(set(output_paths).difference(existing))
+        raise ValueError(
+            "partial candidate cache detected; existing outputs were preserved: "
+            f"{sorted(existing)}; missing outputs: {missing}. Review them, then use "
+            "--overwrite to rebuild only the cache (raw BM25 runs are never removed)."
+        )
+    for path in output_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    input_metadata = _candidate_input_metadata(
+        config,
+        annotation_paths,
+        reproduction_path=reproduction_path,
+        dev_top100_path=dev_top100_path,
+    )
+    if existing == set(output_paths) and not args.overwrite:
+        validated = _validate_candidate_cache_artifacts(
+            config,
+            dev_top100=dev_top100,
+            expected_inputs=input_metadata,
+        )
+        _print_json(
+            {
+                "status": "ok",
+                "action": "reused_valid_candidate_cache",
+                "dev_top100_action": dev_top100_action,
+                "train_rows": int(len(validated["candidates"]["train"])),
+                "dev_rows": int(len(validated["candidates"]["dev"])),
+                "queries": int(len(validated["queries"])),
+                "unique_passages": int(len(validated["passages"])),
+            }
+        )
+        return 0
 
     candidate_frames: dict[str, pd.DataFrame] = {}
     depth_audits: dict[str, dict[str, object]] = {}
@@ -1043,41 +1820,74 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
         ).astype("string")
     )
     extraction_started = time.perf_counter()
-    passages = stream_candidate_passages(
-        candidate_docids,
-        dataset_name=str(config["dataset"]["corpus_source"]),
-        language=str(config["dataset"]["language"]),
-        revision=str(config["dataset"]["corpus_revision"]),
-    )
+    try:
+        passages = stream_candidate_passages(
+            candidate_docids,
+            dataset_name=str(config["dataset"]["corpus_source"]),
+            language=str(config["dataset"]["language"]),
+            revision=str(config["dataset"]["corpus_revision"]),
+        )
+    except MissingCandidatePassagesError as exc:
+        preview_docids = set(exc.missing_docids[:10])
+        context = _candidate_locations(
+            candidate_frames,
+            only_docids=preview_docids,
+        )
+        raise MissingCandidatePassagesError(
+            exc.missing_docids,
+            candidate_context=context,
+        ) from exc
     extraction_seconds = time.perf_counter() - extraction_started
     validate_passages(passages)
     if set(passages["docid"].astype("string")) != candidate_docids:
         raise ValueError("passage extraction did not produce exact candidate coverage")
 
-    _atomic_parquet(candidate_frames["train"], train_candidates_path)
-    _atomic_parquet(candidate_frames["dev"], dev_candidates_path)
-    _atomic_parquet(queries, queries_path)
-    _atomic_parquet(passages, passages_path)
+    current_inputs = _candidate_input_metadata(
+        config,
+        annotation_paths,
+        reproduction_path=reproduction_path,
+        dev_top100_path=dev_top100_path,
+    )
+    if current_inputs != input_metadata or _sha256(dev_run_path) != dev_source_hash:
+        raise RuntimeError("candidate-cache inputs changed during passage extraction")
+
+    _atomic_parquet(candidate_frames["train"], output_paths["train_candidates"])
+    _atomic_parquet(candidate_frames["dev"], output_paths["dev_candidates"])
+    _atomic_parquet(queries, output_paths["queries"])
+    _atomic_parquet(passages, output_paths["passages"])
     work_path = _resolve_repository_path(
         config, config["paths"]["work_dir"]
     ) / "candidate_cache.json"
+    output_metadata = {
+        name: _file_metadata(config, path) for name, path in output_paths.items()
+    }
     _write_json(
         work_path,
         {
+            "status": "PASS",
+            "producer_command": (
+                "python -m rusearchrank.cli build-candidate-cache "
+                "--config configs/retrieval.yaml"
+            ),
             "passage_extraction_seconds": extraction_seconds,
             "unique_passages": int(len(passages)),
             "train_rows": int(len(candidate_frames["train"])),
             "dev_rows": int(len(candidate_frames["dev"])),
-            "dev_top1000_run": str(dev_run_path),
+            "dev_top1000_run": _portable_repository_path(config, dev_run_path),
             "dev_top1000_sha256": dev_source_hash,
-            "dev_top100_run": str(dev_top100_path),
+            "dev_top100_run": _portable_repository_path(config, dev_top100_path),
             "dev_top100_sha256": _sha256(dev_top100_path),
+            "dev_top100_action": dev_top100_action,
             "retrieval_depth": depth_audits,
+            "input_artifacts": input_metadata,
+            "output_artifacts": output_metadata,
         },
     )
     _print_json(
         {
             "status": "ok",
+            "action": "rebuilt_candidate_cache" if existing else "created_candidate_cache",
+            "dev_top100_action": dev_top100_action,
             "train_rows": int(len(candidate_frames["train"])),
             "dev_rows": int(len(candidate_frames["dev"])),
             "queries": int(len(queries)),
@@ -1132,6 +1942,12 @@ def _run_trec_eval_binary(executable: Path, arguments: list[str]) -> dict[str, A
             f"with exit code {exc.returncode}: {' '.join(command)}\n"
             f"stdout:\n{exc.stdout or ''}\nstderr:\n{exc.stderr or ''}"
         ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "official trec_eval command timed out: "
+            f"{' '.join(command)}\nstdout:\n{exc.stdout or ''}\n"
+            f"stderr:\n{exc.stderr or ''}"
+        ) from exc
     return {
         "command": command,
         "returncode": result.returncode,
@@ -1155,6 +1971,8 @@ def _probe_trec_eval(executable: Path) -> dict[str, Any]:
             f"trec_eval -h failed with exit code {exc.returncode}: "
             f"{exc.stderr or exc.stdout or ''}"
         ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"trec_eval -h timed out: {exc}") from exc
     return {
         "command": command,
         "returncode": result.returncode,
@@ -1314,7 +2132,7 @@ def _audit_qrels(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
     output = _audit_path(config, "qrels")
     _ensure_writable_targets([output], overwrite=args.overwrite)
-    annotation_paths = _annotation_paths(config)
+    annotation_paths, _ = _validate_official_annotations(config)
     queries = pd.read_parquet(_artifact_path(config, "queries"))
     validate_queries(queries)
     split_reports: dict[str, Any] = {}
@@ -1323,13 +2141,22 @@ def _audit_qrels(args: argparse.Namespace) -> int:
         qrels = load_qrels(annotation_paths[split]["qrels"], split=split)
         candidates = read_candidate_table(_artifact_path(config, f"{split}_candidates"))
         validate_candidate_schema(candidates)
-        split_reports[split] = build_qrels_split_audit(
+        report = build_qrels_split_audit(
             queries=split_queries,
             qrels=qrels,
             candidates=candidates,
         )
+        report["inputs"] = {
+            "topics": _file_metadata(config, annotation_paths[split]["topics"]),
+            "qrels": _file_metadata(config, annotation_paths[split]["qrels"]),
+            "candidates": _file_metadata(
+                config, _artifact_path(config, f"{split}_candidates")
+            ),
+            "queries": _file_metadata(config, _artifact_path(config, "queries")),
+        }
+        split_reports[split] = report
     payload = {
-        "status": "COMPLETED",
+        "status": "PASS",
         "audited_at": datetime.now(timezone.utc).isoformat(),
         "annotations_revision": config["dataset"]["annotations_revision"],
         "splits": split_reports,
@@ -1341,81 +2168,202 @@ def _audit_qrels(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tabular_contract(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() == ".parquet":
+        frame = pd.read_parquet(path)
+        return {
+            "row_count": int(len(frame)),
+            "schema": {column: str(dtype) for column, dtype in frame.dtypes.items()},
+        }
+    if path.suffix.lower() == ".trec":
+        with path.open("r", encoding="utf-8") as stream:
+            row_count = sum(1 for line in stream if line.strip())
+        return {
+            "row_count": row_count,
+            "schema": {
+                "query_id": "string",
+                "q0": "string",
+                "docid": "string",
+                "rank": "int64",
+                "score": "float64",
+                "tag": "string",
+            },
+        }
+    return {"row_count": None, "schema": None}
+
+
+def _artifact_manifest_entry(
+    config: dict[str, Any],
+    path: Path,
+    *,
+    producer_command: str,
+    input_hashes: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        **_file_metadata(config, path),
+        **_tabular_contract(path),
+        "producer_command": producer_command,
+        "input_hashes": input_hashes,
+    }
+
+
+def _validate_manifest_artifacts(
+    config: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    expected_paths: list[Path],
+    expected_input_hashes: dict[str, dict[str, str]] | None = None,
+) -> None:
+    if manifest.get("status") != "PASS":
+        raise ValueError("candidate-cache manifest status is not PASS")
+    entries = manifest.get("artifacts")
+    if not isinstance(entries, list):
+        raise ValueError("candidate-cache manifest artifacts must be a list")
+    by_path = {
+        str(entry.get("path")): entry for entry in entries if isinstance(entry, dict)
+    }
+    expected_names = {
+        _portable_repository_path(config, path) for path in expected_paths
+    }
+    if set(by_path) != expected_names:
+        raise ValueError("manifest artifact paths do not match the exact allowlist")
+    for path in expected_paths:
+        name = _portable_repository_path(config, path)
+        entry = by_path[name]
+        if entry.get("size_bytes") != path.stat().st_size:
+            raise ValueError(f"stale manifest size for {name}")
+        if entry.get("sha256") != _sha256(path):
+            raise ValueError(f"stale manifest SHA-256 for {name}")
+        if "producer_command" not in entry or "input_hashes" not in entry:
+            raise ValueError(f"manifest provenance is incomplete for {name}")
+        if expected_input_hashes is not None and entry.get("input_hashes") != (
+            expected_input_hashes[name]
+        ):
+            raise ValueError(f"stale manifest input hashes for {name}")
+        if not all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in entry.get("input_hashes", {}).values()
+        ):
+            raise ValueError(f"manifest contains an invalid input hash for {name}")
+        contract = _tabular_contract(path)
+        if entry.get("row_count") != contract["row_count"]:
+            raise ValueError(f"stale manifest row count for {name}")
+        if entry.get("schema") != contract["schema"]:
+            raise ValueError(f"stale manifest schema for {name}")
+
+
+def _validate_phase1_archive(
+    config: dict[str, Any],
+    archive_path: Path,
+    manifest_path: Path,
+    *,
+    payload_paths: list[Path],
+    expected_input_hashes: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    _require_nonempty_regular_file(archive_path, label="Phase 1 ZIP")
+    _require_nonempty_regular_file(manifest_path, label="candidate-cache manifest")
+    manifest = _read_json(manifest_path)
+    _validate_manifest_artifacts(
+        config,
+        manifest,
+        expected_paths=payload_paths,
+        expected_input_hashes=expected_input_hashes,
+    )
+    allowlist = [
+        *[_portable_repository_path(config, path) for path in payload_paths],
+        _portable_repository_path(config, manifest_path),
+    ]
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        if names != allowlist or len(set(names)) != len(names):
+            raise ValueError("ZIP contents do not match the exact ordered allowlist")
+        for info in archive.infolist():
+            member = Path(info.filename)
+            if member.is_absolute() or ".." in member.parts or info.is_dir():
+                raise ValueError(f"unsafe or unexpected ZIP member: {info.filename}")
+        corrupt = archive.testzip()
+        if corrupt is not None:
+            raise ValueError(f"ZIP CRC validation failed for {corrupt}")
+        archived_manifest = json.loads(
+            archive.read(_portable_repository_path(config, manifest_path)).decode("utf-8")
+        )
+        if archived_manifest != manifest:
+            raise ValueError("archived manifest differs from the validated manifest")
+        with tempfile.TemporaryDirectory(prefix="rusearchrank-zip-verify-") as directory:
+            extraction_root = Path(directory)
+            archive.extractall(extraction_root)
+            for entry in manifest["artifacts"]:
+                extracted = extraction_root / str(entry["path"])
+                if not extracted.is_file():
+                    raise ValueError(f"ZIP extraction is missing {entry['path']}")
+                if extracted.stat().st_size != entry["size_bytes"]:
+                    raise ValueError(f"extracted size mismatch for {entry['path']}")
+                if _sha256(extracted) != entry["sha256"]:
+                    raise ValueError(f"extracted SHA-256 mismatch for {entry['path']}")
+            extracted_manifest = _read_json(
+                extraction_root / _portable_repository_path(config, manifest_path)
+            )
+            if extracted_manifest != manifest:
+                raise ValueError("manifest changed after ZIP extraction")
+    return {
+        "path": _portable_repository_path(config, archive_path),
+        "size_bytes": archive_path.stat().st_size,
+        "sha256": _sha256(archive_path),
+        "contents": allowlist,
+    }
+
+
 def _package_phase1(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
-    archive_path = Path(str(config["archive"]["path"]))
+    _preflight_candidate_cache(config)
+    archive_path = _resolve_repository_path(config, config["archive"]["path"])
     manifest_path = _audit_path(config, "manifest")
-    _ensure_writable_targets([archive_path, manifest_path], overwrite=args.overwrite)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     reproduction_path = _audit_path(config, "reproduction")
     qrels_path = _audit_path(config, "qrels")
-    reproduction = _read_json(reproduction_path)
+    reproduction, _, _ = _require_reproduction_gate(config)
     qrels_audit = _read_json(qrels_path)
     dev_top1000_path = _artifact_path(config, "dev_run")
     dev_top100_path = _artifact_path(config, "dev_top100_run")
     train_run_path = _artifact_path(config, "train_run")
-    if reproduction.get("status") != "PASS" or reproduction.get("gate_passed") is not True:
-        raise ValueError("a passed official reproduction gate is required before packaging")
-    if reproduction.get("source_run") != str(dev_top1000_path):
+    if reproduction.get("source_run") != _portable_repository_path(
+        config, dev_top1000_path
+    ):
         raise ValueError("reproduction audit does not identify the configured dev top-1000 run")
     if reproduction.get("source_run_sha256") != _sha256(dev_top1000_path):
         raise ValueError("dev top-1000 run no longer matches its reproduction audit")
-    if qrels_audit.get("status") != "COMPLETED":
-        raise ValueError("a completed qrels audit is required before packaging")
+    if qrels_audit.get("status") != "PASS":
+        raise ValueError("a passed qrels audit is required before packaging")
+    if not isinstance(qrels_audit.get("splits"), dict):
+        raise ValueError("qrels audit is missing split reports")
     if not bool(config["archive"].get("include_runs", False)):
         raise ValueError("Phase 1A archive must include all provenance runs")
 
-    candidates = {
-        split: read_candidate_table(_artifact_path(config, f"{split}_candidates"))
-        for split in ("train", "dev")
-    }
-    for frame in candidates.values():
-        validate_candidate_schema(frame)
-        validate_top_k(
-            frame,
-            int(config["retrieval"]["candidate_depth"]),
-            require_exact=False,
-        )
-        validate_stable_order(frame)
-    queries = pd.read_parquet(_artifact_path(config, "queries"))
-    passages = pd.read_parquet(_artifact_path(config, "passages"))
-    validate_queries(queries)
-    validate_passages(passages)
-    all_docids = set(
-        pd.concat([frame["docid"] for frame in candidates.values()]).astype("string")
-    )
-    if all_docids != set(passages["docid"].astype("string")):
-        raise ValueError("passages.parquet does not exactly cover candidate docids")
-    for split, frame in candidates.items():
-        expected = queries.loc[queries["split"].astype("string").eq(split)]
-        validate_query_coverage(frame, expected)
-
     top_k = int(config["retrieval"]["candidate_depth"])
-    raw_dev = read_trec_run(str(dev_top1000_path), split="dev")
-    _validate_raw_trec_depth(
-        raw_dev,
-        requested_top_k=int(config["retrieval"]["retrieval_hits"]["dev"]),
+    actual_dev_top100 = _validate_stable_trec_derivation(
+        dev_top1000_path,
+        dev_top100_path,
+        split="dev",
+        top_k=top_k,
+        source_top_k=int(config["retrieval"]["retrieval_hits"]["dev"]),
     )
-    expected_dev_top100 = normalize_bm25_run(
-        raw_dev[["split", "query_id", "docid", "bm25_score"]], top_k=top_k
+    annotation_paths, _ = _validate_official_annotations(config)
+    expected_cache_inputs = _candidate_input_metadata(
+        config,
+        annotation_paths,
+        reproduction_path=reproduction_path,
+        dev_top100_path=dev_top100_path,
     )
-    portable_dev = read_trec_run(str(dev_top100_path), split="dev")
-    _validate_raw_trec_depth(portable_dev, requested_top_k=top_k)
-    actual_dev_top100 = normalize_bm25_run(
-        portable_dev[["split", "query_id", "docid", "bm25_score"]], top_k=top_k
+    cache = _validate_candidate_cache_artifacts(
+        config,
+        dev_top100=actual_dev_top100,
+        expected_inputs=expected_cache_inputs,
     )
-    validate_top_k(actual_dev_top100, top_k, require_exact=False)
-    validate_stable_order(actual_dev_top100)
-    run_columns = ["split", "query_id", "docid", "bm25_rank", "bm25_score"]
-    if not expected_dev_top100[run_columns].equals(actual_dev_top100[run_columns]):
-        raise ValueError("dev top-100 run is not the stable truncation of dev top-1000")
-    candidate_core = candidates["dev"][run_columns].reset_index(drop=True).copy()
-    for column in ("split", "query_id", "docid"):
-        candidate_core[column] = candidate_core[column].astype("string")
-    candidate_core["bm25_rank"] = candidate_core["bm25_rank"].astype("int64")
-    candidate_core["bm25_score"] = candidate_core["bm25_score"].astype("float64")
-    if not candidate_core.equals(actual_dev_top100[run_columns]):
-        raise ValueError("dev candidate cache does not match the portable dev top-100 run")
+    candidates = cache["candidates"]
+    queries = cache["queries"]
+    passages = cache["passages"]
 
     payload_paths = [
         dev_top1000_path,
@@ -1431,6 +2379,101 @@ def _package_phase1(args: argparse.Namespace) -> int:
     missing = [str(path) for path in payload_paths if not path.is_file()]
     if missing:
         raise ValueError(f"phase1 package inputs are missing: {', '.join(missing)}")
+
+    for split in ("train", "dev"):
+        split_audit = qrels_audit["splits"].get(split, {})
+        expected_qrels_inputs = {
+            "topics": _file_metadata(config, annotation_paths[split]["topics"]),
+            "qrels": _file_metadata(config, annotation_paths[split]["qrels"]),
+            "candidates": _file_metadata(
+                config, _artifact_path(config, f"{split}_candidates")
+            ),
+            "queries": _file_metadata(config, _artifact_path(config, "queries")),
+        }
+        if split_audit.get("inputs") != expected_qrels_inputs:
+            raise ValueError(f"{split} qrels audit is stale or bound to other inputs")
+
+    cache_input_hashes = {
+        name: str(metadata["sha256"])
+        for name, metadata in expected_cache_inputs.items()
+    }
+    train_candidates_path = _artifact_path(config, "train_candidates")
+    dev_candidates_path = _artifact_path(config, "dev_candidates")
+    queries_path = _artifact_path(config, "queries")
+    passages_path = _artifact_path(config, "passages")
+    train_candidate_hash = _sha256(train_candidates_path)
+    dev_candidate_hash = _sha256(dev_candidates_path)
+    queries_hash = _sha256(queries_path)
+    artifact_input_hashes = {
+        _portable_repository_path(config, train_run_path): {
+            "train_topics": cache_input_hashes["train_topics"],
+        },
+        _portable_repository_path(config, dev_top1000_path): {
+            "dev_topics": cache_input_hashes["dev_topics"],
+        },
+        _portable_repository_path(config, dev_top100_path): {
+            "dev_top1000_run": cache_input_hashes["dev_top1000_run"],
+            "reproduction_audit": cache_input_hashes["reproduction_audit"],
+        },
+        _portable_repository_path(config, train_candidates_path): {
+            "train_run": cache_input_hashes["train_run"],
+            "train_topics": cache_input_hashes["train_topics"],
+            "train_qrels": cache_input_hashes["train_qrels"],
+        },
+        _portable_repository_path(config, dev_candidates_path): {
+            "dev_top100_run": cache_input_hashes["dev_top100_run"],
+            "dev_topics": cache_input_hashes["dev_topics"],
+            "dev_qrels": cache_input_hashes["dev_qrels"],
+            "reproduction_audit": cache_input_hashes["reproduction_audit"],
+        },
+        _portable_repository_path(config, queries_path): {
+            "train_topics": cache_input_hashes["train_topics"],
+            "dev_topics": cache_input_hashes["dev_topics"],
+        },
+        _portable_repository_path(config, passages_path): {
+            "train_candidates": train_candidate_hash,
+            "dev_candidates": dev_candidate_hash,
+        },
+        _portable_repository_path(config, reproduction_path): {
+            "dev_top1000_run": cache_input_hashes["dev_top1000_run"],
+            "dev_qrels": cache_input_hashes["dev_qrels"],
+        },
+        _portable_repository_path(config, qrels_path): {
+            "train_qrels": cache_input_hashes["train_qrels"],
+            "dev_qrels": cache_input_hashes["dev_qrels"],
+            "train_candidates": train_candidate_hash,
+            "dev_candidates": dev_candidate_hash,
+            "queries": queries_hash,
+        },
+    }
+
+    existing_package = {
+        "archive": archive_path.exists(),
+        "manifest": manifest_path.exists(),
+    }
+    if any(existing_package.values()) and not all(existing_package.values()):
+        raise ValueError(
+            "partial package output detected and preserved: "
+            f"{existing_package}. Use --overwrite only after review."
+        )
+    if all(existing_package.values()) and not args.overwrite:
+        try:
+            archive_report = _validate_phase1_archive(
+                config,
+                archive_path,
+                manifest_path,
+                payload_paths=payload_paths,
+                expected_input_hashes=artifact_input_hashes,
+            )
+        except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc:
+            raise ValueError(
+                "existing Phase 1 package is invalid or stale and was preserved; "
+                f"use --overwrite only after review. Validation error: {exc}"
+            ) from exc
+        _print_json(
+            {"status": "ok", "action": "reused_valid_package", **archive_report}
+        )
+        return 0
 
     work_dir = _resolve_repository_path(config, config["paths"]["work_dir"])
     timings: dict[str, Any] = {}
@@ -1448,6 +2491,35 @@ def _package_phase1(args: argparse.Namespace) -> int:
         )
     text_lengths = passages["text"].astype("string").str.len()
     runtime_environment = _phase1_environment(config)
+    producers = {
+        _portable_repository_path(config, train_run_path): (
+            "python -m rusearchrank.cli run-bm25 --config configs/retrieval.yaml "
+            "--split train"
+        ),
+        _portable_repository_path(config, dev_top1000_path): (
+            "python -m rusearchrank.cli run-bm25 --config configs/retrieval.yaml "
+            "--split dev"
+        ),
+        _portable_repository_path(config, dev_top100_path): (
+            "python -m rusearchrank.cli build-candidate-cache "
+            "--config configs/retrieval.yaml"
+        ),
+        _portable_repository_path(config, reproduction_path): (
+            "python -m rusearchrank.cli evaluate-bm25 "
+            "--config configs/retrieval.yaml"
+        ),
+        _portable_repository_path(config, qrels_path): (
+            "python -m rusearchrank.cli audit-qrels --config configs/retrieval.yaml"
+        ),
+    }
+    cache_producer = (
+        "python -m rusearchrank.cli build-candidate-cache "
+        "--config configs/retrieval.yaml"
+    )
+    for key in ("train_candidates", "dev_candidates", "queries", "passages"):
+        producers[_portable_repository_path(config, _artifact_path(config, key))] = (
+            cache_producer
+        )
     manifest = {
         "status": "PASS",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1481,6 +2553,7 @@ def _package_phase1(args: argparse.Namespace) -> int:
             "platform_detail": runtime_environment["platform_detail"],
             "python": runtime_environment["python"],
             "java_major": runtime_environment["java_major"],
+            "java_home": runtime_environment["java_home"],
             "java_version_output": runtime_environment["java"]["output"],
             "pyserini": runtime_environment["pyserini"],
             "cpu_count": runtime_environment["cpu_count"],
@@ -1525,59 +2598,85 @@ def _package_phase1(args: argparse.Namespace) -> int:
                 "three-state candidate cache",
             ],
             "dev_top1000": {
-                "path": str(dev_top1000_path),
+                "path": _portable_repository_path(config, dev_top1000_path),
                 "sha256": _sha256(dev_top1000_path),
                 "size_bytes": dev_top1000_path.stat().st_size,
             },
             "reproduction_audit": {
-                "path": str(reproduction_path),
+                "path": _portable_repository_path(config, reproduction_path),
                 "status": reproduction["status"],
                 "source_run_sha256": reproduction["source_run_sha256"],
             },
             "dev_top100": {
-                "path": str(dev_top100_path),
+                "path": _portable_repository_path(config, dev_top100_path),
                 "sha256": _sha256(dev_top100_path),
                 "size_bytes": dev_top100_path.stat().st_size,
             },
             "candidate_cache": {
-                "train": str(_artifact_path(config, "train_candidates")),
-                "dev": str(_artifact_path(config, "dev_candidates")),
-                "judgment_states": ["relevant", "non_relevant", "unjudged"],
+                "train": _portable_repository_path(
+                    config, _artifact_path(config, "train_candidates")
+                ),
+                "dev": _portable_repository_path(
+                    config, _artifact_path(config, "dev_candidates")
+                ),
+                "judgment_states": [
+                    "relevant",
+                    "judged_non_relevant",
+                    "unjudged",
+                ],
+                "input_hashes": cache_input_hashes,
             },
         },
         "timings": timings,
         "artifacts": [
-            {
-                "path": str(path),
-                "size_bytes": path.stat().st_size,
-                "sha256": _sha256(path),
-            }
+            _artifact_manifest_entry(
+                config,
+                path,
+                producer_command=producers[_portable_repository_path(config, path)],
+                input_hashes=artifact_input_hashes[
+                    _portable_repository_path(config, path)
+                ],
+            )
             for path in payload_paths
         ],
     }
     _write_json(manifest_path, manifest)
     archive_inputs = [*payload_paths, manifest_path]
-    temporary_archive = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    temporary_archive = archive_path.with_name(
+        f"{archive_path.name}.tmp.{os.getpid()}"
+    )
+    if temporary_archive.exists():
+        raise ValueError(
+            f"diagnostic temporary ZIP already exists and was preserved: {temporary_archive}"
+        )
     with zipfile.ZipFile(
         temporary_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
     ) as archive:
         for path in archive_inputs:
-            archive.write(path, arcname=path.as_posix())
-    expected_archive_names = [path.as_posix() for path in archive_inputs]
-    with zipfile.ZipFile(temporary_archive) as archive:
-        if archive.namelist() != expected_archive_names:
-            temporary_archive.unlink(missing_ok=True)
-            raise RuntimeError("ZIP contents do not match the exact Phase 1A allowlist")
+            archive.write(path, arcname=_portable_repository_path(config, path))
+    with temporary_archive.open("rb") as stream:
+        os.fsync(stream.fileno())
+    try:
+        _validate_phase1_archive(
+            config,
+            temporary_archive,
+            manifest_path,
+            payload_paths=payload_paths,
+            expected_input_hashes=artifact_input_hashes,
+        )
+    except (ValueError, OSError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(
+            f"temporary ZIP validation failed; preserved at {temporary_archive}: {exc}"
+        ) from exc
     temporary_archive.replace(archive_path)
-    _print_json(
-        {
-            "status": "ok",
-            "archive": str(archive_path),
-            "size_bytes": archive_path.stat().st_size,
-            "sha256": _sha256(archive_path),
-            "contents": [path.as_posix() for path in archive_inputs],
-        }
+    archive_report = _validate_phase1_archive(
+        config,
+        archive_path,
+        manifest_path,
+        payload_paths=payload_paths,
+        expected_input_hashes=artifact_input_hashes,
     )
+    _print_json({"status": "ok", "action": "created_package", **archive_report})
     return 0
 
 
@@ -1652,6 +2751,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     linux_parser.set_defaults(func=_inspect_linux_environment)
 
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="validate the environment and all inputs before a heavy Phase 1 stage",
+    )
+    preflight_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    preflight_parser.add_argument(
+        "--stage",
+        choices=("retrieval", "candidate-cache", "package"),
+        required=True,
+    )
+    preflight_parser.add_argument(
+        "--check-index",
+        action="store_true",
+        help="open/download and smoke-test the official prebuilt index",
+    )
+    preflight_parser.set_defaults(func=_preflight_command)
+
     bm25_parser = subparsers.add_parser(
         "run-bm25", help="run guarded full Pyserini BM25 retrieval"
     )
@@ -1698,7 +2814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (ValueError, RuntimeError, OSError) as exc:
+    except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
