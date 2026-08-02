@@ -150,6 +150,87 @@ def validate_query_coverage(run: pd.DataFrame, expected_queries: pd.DataFrame) -
         )
 
 
+def build_retrieval_depth_audit(
+    run: pd.DataFrame,
+    topics: pd.DataFrame,
+    *,
+    requested_top_k: int,
+) -> dict[str, object]:
+    """Summarize variable retrieval depth while preserving full topic coverage."""
+
+    validate_top_k(run, requested_top_k, require_exact=False)
+    required_topics = {"split", "query_id", "query_text"}
+    missing_columns = sorted(required_topics.difference(topics.columns))
+    if missing_columns:
+        raise ValueError(
+            "topics are missing required columns: " + ", ".join(missing_columns)
+        )
+    normalized_topics = topics[["split", "query_id", "query_text"]].copy()
+    for column in ("split", "query_id", "query_text"):
+        normalized_topics[column] = normalized_topics[column].astype("string")
+    if normalized_topics[["split", "query_id"]].duplicated(keep=False).any():
+        raise ValueError("topics contain duplicate (split, query_id) pairs")
+
+    expected_keys = set(
+        map(tuple, normalized_topics[["split", "query_id"]].to_numpy())
+    )
+    observed_keys = set(map(tuple, run[["split", "query_id"]].astype("string").to_numpy()))
+    unknown = sorted(observed_keys.difference(expected_keys))
+    if unknown:
+        raise ValueError(f"BM25 run contains unknown query_id values: {unknown[:10]}")
+
+    counts = (
+        run.assign(
+            split=run["split"].astype("string"),
+            query_id=run["query_id"].astype("string"),
+        )
+        .groupby(["split", "query_id"], sort=False)
+        .size()
+        .rename("candidate_count")
+        .reset_index()
+    )
+    coverage = normalized_topics.merge(
+        counts,
+        on=["split", "query_id"],
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
+    coverage["candidate_count"] = (
+        coverage["candidate_count"].fillna(0).astype("int64")
+    )
+    coverage["shortfall"] = requested_top_k - coverage["candidate_count"]
+    positive_short = coverage["candidate_count"].between(1, requested_top_k - 1)
+    zero_hit = coverage["candidate_count"].eq(0)
+
+    def rows_for(mask: pd.Series) -> list[dict[str, object]]:
+        return [
+            {
+                "query_id": str(row.query_id),
+                "query_text": str(row.query_text),
+                "candidate_count": int(row.candidate_count),
+                "shortfall": int(row.shortfall),
+            }
+            for row in coverage.loc[mask].itertuples(index=False)
+        ]
+
+    candidate_counts = coverage["candidate_count"]
+    return {
+        "requested_top_k": requested_top_k,
+        "query_count": int(len(coverage)),
+        "queries_in_run": int(len(counts)),
+        "full_depth_query_count": int(candidate_counts.eq(requested_top_k).sum()),
+        "short_query_count": int(positive_short.sum()),
+        "zero_hit_query_count": int(zero_hit.sum()),
+        "minimum_candidate_count": int(candidate_counts.min()),
+        "maximum_candidate_count": int(candidate_counts.max()),
+        "total_candidate_rows": int(candidate_counts.sum()),
+        "total_shortfall": int(coverage["shortfall"].sum()),
+        "short_queries": rows_for(positive_short),
+        "zero_hit_queries": rows_for(zero_hit),
+    }
+
+
 def validate_stable_order(run: pd.DataFrame) -> None:
     """Require rows and ranks to equal the deterministic score/docid ordering."""
 
@@ -259,8 +340,8 @@ def run_pyserini_bm25(
             )
     if not rows:
         raise RuntimeError("Pyserini returned no BM25 results")
-    normalized = normalize_bm25_run(pd.DataFrame(rows), top_k=top_k)
-    validate_top_k(normalized, top_k)
+    normalized = normalize_bm25_run(pd.DataFrame(rows))
+    validate_top_k(normalized, top_k, require_exact=False)
     validate_query_coverage(normalized, queries)
     return normalized
 

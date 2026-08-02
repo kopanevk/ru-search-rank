@@ -40,6 +40,7 @@ from .evaluation import (
     reproduction_rows,
 )
 from .retrieval import (
+    build_retrieval_depth_audit,
     join_qrels,
     normalize_bm25_run,
     read_trec_run,
@@ -646,7 +647,7 @@ def _validate_candidates(args: argparse.Namespace) -> int:
     validate_candidate_schema(candidates)
     config = _load_retrieval_config(args.config)
     top_k = int(config["retrieval"]["candidate_depth"])
-    validate_top_k(candidates, top_k)
+    validate_top_k(candidates, top_k, require_exact=False)
     validate_stable_order(candidates)
 
     queries_path = _artifact_path(config, "queries")
@@ -770,9 +771,37 @@ def _build_bm25_command(
     ]
 
 
+def _zero_hit_query_ids(depth_audit: dict[str, object]) -> list[str]:
+    rows = depth_audit.get("zero_hit_queries", [])
+    if not isinstance(rows, list):
+        raise ValueError("retrieval-depth audit has invalid zero_hit_queries")
+    return [str(row["query_id"]) for row in rows]
+
+
+def _require_no_zero_hits(
+    depth_audit: dict[str, object],
+    *,
+    context: str,
+) -> None:
+    query_ids = _zero_hit_query_ids(depth_audit)
+    if query_ids:
+        raise ValueError(f"{context}; zero-hit query_id values: " + ", ".join(query_ids))
+
+
+def _validate_raw_trec_depth(
+    raw_run: pd.DataFrame,
+    *,
+    requested_top_k: int,
+) -> None:
+    source_ranked = raw_run.rename(columns={"source_rank": "bm25_rank"})[
+        ["split", "query_id", "docid", "bm25_rank", "bm25_score"]
+    ]
+    validate_top_k(source_ranked, requested_top_k, require_exact=False)
+
+
 def _run_bm25(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
-    environment = _require_external_environment(config)
+    _require_external_environment(config)
     splits = list(config["splits"]) if args.split == "all" else [args.split]
     run_keys = {"train": "train_run", "dev": "dev_run"}
     targets = [
@@ -823,38 +852,65 @@ def _run_bm25(args: argparse.Namespace) -> int:
         elapsed = time.perf_counter() - started
         if not temporary.is_file():
             raise RuntimeError("official Pyserini retrieval did not create its run file")
-        raw_run = read_trec_run(str(temporary), split=split)
-        validated = normalize_bm25_run(
-            raw_run[["split", "query_id", "docid", "bm25_score"]],
-            top_k=retrieval_hits,
-        )
-        validate_top_k(validated, retrieval_hits)
-        validate_query_coverage(validated, queries)
-        # Preserve Pyserini's raw output byte-for-byte for official evaluation.
-        temporary.replace(target)
         work_path = _resolve_repository_path(
             config, config["paths"]["work_dir"]
         ) / f"retrieval_{split}.json"
-        _write_json(
-            work_path,
-            {
-                "split": split,
-                "seconds": elapsed,
-                "queries": int(len(queries)),
-                "rows": int(len(raw_run)),
-                "hits_per_query": retrieval_hits,
-                "topics_argument": topics_argument,
-                "train_topics": train_topics_metadata,
-                "command": command,
-                "run": _portable_repository_path(config, target),
-            },
-        )
+        try:
+            raw_run = read_trec_run(str(temporary), split=split)
+            _validate_raw_trec_depth(
+                raw_run,
+                requested_top_k=retrieval_hits,
+            )
+            validated = normalize_bm25_run(
+                raw_run[["split", "query_id", "docid", "bm25_score"]]
+            )
+            depth_audit = build_retrieval_depth_audit(
+                validated,
+                queries,
+                requested_top_k=retrieval_hits,
+            )
+        except (ValueError, RuntimeError) as exc:
+            preserved = _portable_repository_path(config, temporary)
+            raise ValueError(
+                f"BM25 run validation failed: {exc}. Raw run preserved at {preserved}"
+            ) from exc
+
+        run_report = {
+            "split": split,
+            "seconds": elapsed,
+            "queries": int(len(queries)),
+            "rows": int(len(raw_run)),
+            "hits_per_query": retrieval_hits,
+            "topics_argument": topics_argument,
+            "train_topics": train_topics_metadata,
+            "command": command,
+            "run": _portable_repository_path(config, target),
+            "raw_validation_path": _portable_repository_path(config, temporary),
+            "depth_audit": depth_audit,
+        }
+        zero_hit_ids = _zero_hit_query_ids(depth_audit)
+        if zero_hit_ids:
+            run_report["status"] = "FAIL_ZERO_HIT_QUERIES"
+            _write_json(work_path, run_report)
+            raise ValueError(
+                "BM25 run contains zero-hit queries: "
+                + ", ".join(zero_hit_ids)
+                + ". Raw run preserved at "
+                + _portable_repository_path(config, temporary)
+            )
+        validate_query_coverage(validated, queries)
+        # Preserve Pyserini's raw output byte-for-byte for official evaluation.
+        temporary.replace(target)
+        run_report["status"] = "PASS"
+        run_report["raw_validation_path"] = None
+        _write_json(work_path, run_report)
         results[split] = {
             "run": _portable_repository_path(config, target),
             "queries": int(len(queries)),
             "rows": int(len(raw_run)),
             "hits_per_query": retrieval_hits,
             "seconds": elapsed,
+            "depth_audit": depth_audit,
         }
     _print_json({"status": "ok", "retrieval": results})
     return 0
@@ -866,16 +922,19 @@ def _stable_truncate_trec_run(
     *,
     split: str,
     top_k: int,
+    source_top_k: int | None = None,
 ) -> pd.DataFrame:
     """Write a separate deterministic top-k run without mutating its source."""
 
     source_hash = _sha256(source)
     raw = read_trec_run(str(source), split=split)
+    raw_limit = source_top_k or int(pd.to_numeric(raw["source_rank"]).max())
+    _validate_raw_trec_depth(raw, requested_top_k=raw_limit)
     normalized = normalize_bm25_run(
         raw[["split", "query_id", "docid", "bm25_score"]],
         top_k=top_k,
     )
-    validate_top_k(normalized, top_k)
+    validate_top_k(normalized, top_k, require_exact=False)
     validate_stable_order(normalized)
     temporary = target.with_suffix(target.suffix + ".tmp")
     write_trec_run(
@@ -893,7 +952,7 @@ def _stable_truncate_trec_run(
         portable[["split", "query_id", "docid", "bm25_score"]],
         top_k=top_k,
     )
-    validate_top_k(portable, top_k)
+    validate_top_k(portable, top_k, require_exact=False)
     validate_stable_order(portable)
     return portable
 
@@ -936,11 +995,13 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
         dev_top100_path,
         split="dev",
         top_k=top_k,
+        source_top_k=int(config["retrieval"]["retrieval_hits"]["dev"]),
     )
     if _sha256(dev_run_path) != dev_source_hash:
         raise RuntimeError("dev top-1000 run was modified after reproduction")
 
     candidate_frames: dict[str, pd.DataFrame] = {}
+    depth_audits: dict[str, dict[str, object]] = {}
     query_frames: list[pd.DataFrame] = []
     for split in ("train", "dev"):
         queries = load_topics(annotation_paths[split]["topics"], split=split)
@@ -952,16 +1013,26 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
             if not run_path.is_file():
                 raise ValueError(f"BM25 run does not exist: {run_path}")
             raw_run = read_trec_run(str(run_path), split=split)
+            _validate_raw_trec_depth(raw_run, requested_top_k=top_k)
             normalized = normalize_bm25_run(
-                raw_run[["split", "query_id", "docid", "bm25_score"]],
-                top_k=top_k,
+                raw_run[["split", "query_id", "docid", "bm25_score"]]
             )
-        validate_top_k(normalized, top_k)
+        validate_top_k(normalized, top_k, require_exact=False)
+        depth_audit = build_retrieval_depth_audit(
+            normalized,
+            queries,
+            requested_top_k=top_k,
+        )
+        _require_no_zero_hits(
+            depth_audit,
+            context=f"cannot build {split} candidate cache",
+        )
         validate_query_coverage(normalized, queries)
         candidates = join_qrels(normalized, qrels)
         candidates = candidates.loc[:, list(CANDIDATE_COLUMNS)]
         validate_candidate_schema(candidates)
         candidate_frames[split] = candidates
+        depth_audits[split] = depth_audit
         query_frames.append(queries)
 
     queries = pd.concat(query_frames, ignore_index=True)
@@ -1001,6 +1072,7 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
             "dev_top1000_sha256": dev_source_hash,
             "dev_top100_run": str(dev_top100_path),
             "dev_top100_sha256": _sha256(dev_top100_path),
+            "retrieval_depth": depth_audits,
         },
     )
     _print_json(
@@ -1167,7 +1239,11 @@ def _package_phase1(args: argparse.Namespace) -> int:
     }
     for frame in candidates.values():
         validate_candidate_schema(frame)
-        validate_top_k(frame, int(config["retrieval"]["candidate_depth"]))
+        validate_top_k(
+            frame,
+            int(config["retrieval"]["candidate_depth"]),
+            require_exact=False,
+        )
         validate_stable_order(frame)
     queries = pd.read_parquet(_artifact_path(config, "queries"))
     passages = pd.read_parquet(_artifact_path(config, "passages"))
@@ -1184,14 +1260,19 @@ def _package_phase1(args: argparse.Namespace) -> int:
 
     top_k = int(config["retrieval"]["candidate_depth"])
     raw_dev = read_trec_run(str(dev_top1000_path), split="dev")
+    _validate_raw_trec_depth(
+        raw_dev,
+        requested_top_k=int(config["retrieval"]["retrieval_hits"]["dev"]),
+    )
     expected_dev_top100 = normalize_bm25_run(
         raw_dev[["split", "query_id", "docid", "bm25_score"]], top_k=top_k
     )
     portable_dev = read_trec_run(str(dev_top100_path), split="dev")
+    _validate_raw_trec_depth(portable_dev, requested_top_k=top_k)
     actual_dev_top100 = normalize_bm25_run(
         portable_dev[["split", "query_id", "docid", "bm25_score"]], top_k=top_k
     )
-    validate_top_k(actual_dev_top100, top_k)
+    validate_top_k(actual_dev_top100, top_k, require_exact=False)
     validate_stable_order(actual_dev_top100)
     run_columns = ["split", "query_id", "docid", "bm25_rank", "bm25_score"]
     if not expected_dev_top100[run_columns].equals(actual_dev_top100[run_columns]):
@@ -1300,6 +1381,9 @@ def _package_phase1(args: argparse.Namespace) -> int:
         },
         "local_values": reproduction.get("official_tool_values"),
         "gate_passed": True,
+        "retrieval_depth": timings.get("candidate_cache", {}).get(
+            "retrieval_depth"
+        ),
         "provenance_chain": {
             "flow": [
                 "dev top-1000 run",

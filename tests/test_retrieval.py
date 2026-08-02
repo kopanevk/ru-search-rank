@@ -12,6 +12,7 @@ import yaml
 import rusearchrank.cli as cli_module
 from rusearchrank.cli import _stable_truncate_trec_run, main
 from rusearchrank.retrieval import (
+    build_retrieval_depth_audit,
     join_qrels,
     normalize_bm25_run,
     read_trec_run,
@@ -21,6 +22,122 @@ from rusearchrank.retrieval import (
     validate_top_k,
     write_trec_run,
 )
+
+
+def _variable_depth_run(counts: dict[str, int]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    run_rows: list[dict[str, object]] = []
+    topic_rows: list[dict[str, str]] = []
+    for query_id, count in counts.items():
+        topic_rows.append(
+            {"split": "train", "query_id": query_id, "query_text": f"query {query_id}"}
+        )
+        for rank in range(1, count + 1):
+            run_rows.append(
+                {
+                    "split": "train",
+                    "query_id": query_id,
+                    "docid": f"{query_id}-d{rank:03d}",
+                    "bm25_rank": rank,
+                    "bm25_score": float(101 - rank),
+                }
+            )
+    run = pd.DataFrame(
+        run_rows,
+        columns=["split", "query_id", "docid", "bm25_rank", "bm25_score"],
+    )
+    topics = pd.DataFrame(topic_rows)
+    return run, topics
+
+
+def test_full_depth_100_candidates_passes_depth_audit() -> None:
+    run, topics = _variable_depth_run({"q": 100})
+    audit = build_retrieval_depth_audit(run, topics, requested_top_k=100)
+    assert audit["full_depth_query_count"] == 1
+    assert audit["short_query_count"] == 0
+    assert audit["total_candidate_rows"] == 100
+
+
+def test_63_candidates_passes_and_is_reported_as_short() -> None:
+    run, topics = _variable_depth_run({"375": 63})
+    audit = build_retrieval_depth_audit(run, topics, requested_top_k=100)
+    assert audit["minimum_candidate_count"] == 63
+    assert audit["total_shortfall"] == 37
+    assert audit["short_queries"] == [
+        {
+            "query_id": "375",
+            "query_text": "query 375",
+            "candidate_count": 63,
+            "shortfall": 37,
+        }
+    ]
+
+
+def test_multiple_short_queries_sum_total_shortfall() -> None:
+    run, topics = _variable_depth_run({"375": 63, "2617": 74, "full": 100})
+    audit = build_retrieval_depth_audit(run, topics, requested_top_k=100)
+    assert audit["full_depth_query_count"] == 1
+    assert audit["short_query_count"] == 2
+    assert audit["total_candidate_rows"] == 237
+    assert audit["total_shortfall"] == 63
+
+
+def test_101_candidates_is_rejected() -> None:
+    run, topics = _variable_depth_run({"q": 101})
+    with pytest.raises(ValueError, match="more than top_k=100"):
+        build_retrieval_depth_audit(run, topics, requested_top_k=100)
+
+
+def test_zero_hit_query_is_audited_and_blocks_candidate_cache() -> None:
+    run, topics = _variable_depth_run({"hit": 1, "zero": 0})
+    audit = build_retrieval_depth_audit(run, topics, requested_top_k=100)
+    assert audit["zero_hit_query_count"] == 1
+    assert audit["queries_in_run"] == 1
+    assert audit["zero_hit_queries"] == [
+        {
+            "query_id": "zero",
+            "query_text": "query zero",
+            "candidate_count": 0,
+            "shortfall": 100,
+        }
+    ]
+    with pytest.raises(ValueError, match="zero-hit query_id values: zero"):
+        cli_module._require_no_zero_hits(audit, context="cannot build train candidate cache")
+
+
+def test_depth_audit_requires_every_topic_in_coverage() -> None:
+    run, topics = _variable_depth_run({"present": 1, "missing": 0})
+    audit = build_retrieval_depth_audit(run, topics, requested_top_k=100)
+    assert audit["query_count"] == 2
+    assert audit["queries_in_run"] == 1
+    assert audit["zero_hit_query_count"] == 1
+
+
+def test_raw_trec_rank_gap_is_rejected_before_normalization() -> None:
+    raw = pd.DataFrame(
+        {
+            "split": ["train", "train"],
+            "query_id": ["q", "q"],
+            "docid": ["d1", "d2"],
+            "source_rank": [1, 3],
+            "bm25_score": [2.0, 1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="non-contiguous"):
+        cli_module._validate_raw_trec_depth(raw, requested_top_k=100)
+
+
+def test_raw_trec_duplicate_rank_is_rejected_before_normalization() -> None:
+    raw = pd.DataFrame(
+        {
+            "split": ["train", "train"],
+            "query_id": ["q", "q"],
+            "docid": ["d1", "d2"],
+            "source_rank": [1, 1],
+            "bm25_score": [2.0, 1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate bm25_rank"):
+        cli_module._validate_raw_trec_depth(raw, requested_top_k=100)
 
 
 def test_stable_sorting_preserves_query_order_and_assigns_ranks() -> None:
@@ -644,4 +761,40 @@ def test_train_topics_path_is_resolved_from_config_root_not_cwd(
     )
     assert _argument_after(command, "--topics") == (
         "artifacts/raw/miracl-ru/topics.miracl-v1.0-ru-train.tsv"
+    )
+
+
+def test_invalid_pyserini_run_is_preserved_with_diagnostic_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    contents = "".join(f"q{index}\tquery {index}\n" for index in range(4683))
+    config_path = _write_topics_command_config(tmp_path, contents=contents)
+
+    def fake_pyserini(command: list[str], **kwargs: object) -> object:
+        output = Path(_argument_after(command, "--output"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            "".join(
+                f"q0 Q0 d{rank:03d} {rank} {102 - rank}.0 fake\n"
+                for rank in range(1, 102)
+            ),
+            encoding="utf-8",
+        )
+        return type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "_require_external_environment", lambda config: {})
+    monkeypatch.setattr(cli_module.subprocess, "run", fake_pyserini)
+    assert main(["run-bm25", "--config", str(config_path), "--split", "train"]) == 1
+    temporary = tmp_path / "artifacts/runs/train_bm25_top100.trec.tmp"
+    assert temporary.is_file()
+    assert temporary.as_posix().endswith("train_bm25_top100.trec.tmp")
+    assert "Raw run preserved at artifacts/runs/train_bm25_top100.trec.tmp" in (
+        capsys.readouterr().err
     )
