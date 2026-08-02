@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 import rusearchrank.cli as cli_module
+import shard_fixtures
 from rusearchrank.cli import main
 from rusearchrank.data import extract_passages_from_rows
 from rusearchrank.retrieval import normalize_bm25_run, read_trec_run, write_trec_run
@@ -191,11 +192,30 @@ def _cell11_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         "source_run_size_bytes": dev_raw.stat().st_size,
     }
     (audit_dir / "reproduction.json").write_text(json.dumps(audit), encoding="utf-8")
+    # Real gzip shards, so the candidate cache streams genuine JSONL.GZ bytes.
+    corpus_dir = tmp_path / "artifacts/work/local-corpus"
+    shard_fixtures.write_corpus(
+        corpus_dir,
+        language="ru",
+        shards=[
+            [*shard_fixtures.filler("noise", 5), shard_fixtures.passage("d1")],
+            [shard_fixtures.passage("d2"), *shard_fixtures.filler("other", 3)],
+            [shard_fixtures.passage("d3"), *shard_fixtures.filler("tail", 2)],
+        ],
+    )
     config = {
         "dataset": {
             "language": "ru",
-            "corpus_source": "fixture/corpus",
-            "corpus_revision": "fixture-revision",
+            "corpus_source": "miracl/miracl-corpus",
+            "corpus_revision": "d921ec7e349ce0d28daf30b2da9da5ee698bef0d",
+            "corpus_repo_type": "dataset",
+            "corpus_shard_count": 3,
+            "corpus_shard_files": [
+                f"miracl-corpus-v1.0-ru/docs-{index}.jsonl.gz" for index in range(3)
+            ],
+            "corpus_cache_dir": "artifacts/work/hf-corpus",
+            "corpus_local_dir": "artifacts/work/local-corpus",
+            "corpus_passage_batch_rows": 1,
             "annotations_revision": "fixture-annotations",
             "train_topics_path": str(annotation_paths["train"]["topics"].relative_to(tmp_path)),
             "topics": {"train": "fixture", "dev": "fixture"},
@@ -258,25 +278,30 @@ def test_cell11_continues_with_preexisting_valid_dev_top100(
     monkeypatch.setattr(cli_module, "_preflight_candidate_cache", lambda config: {})
     monkeypatch.setattr(cli_module, "_annotation_paths", lambda config: annotations)
 
-    def fake_passages(candidate_docids: set[str], **_: object) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "docid": sorted(candidate_docids),
-                "title": [""] * len(candidate_docids),
-                "text": [f"text {docid}" for docid in sorted(candidate_docids)],
-            }
-        )
-
-    monkeypatch.setattr(cli_module, "stream_candidate_passages", fake_passages)
     assert main(["build-candidate-cache", "--config", str(config_path)]) == 0
     assert dev_stable.read_bytes() == before
     assert (tmp_path / "artifacts/candidates/train_top100.parquet").is_file()
+    passages = pd.read_parquet(tmp_path / "artifacts/candidates/passages.parquet")
+    assert sorted(passages["docid"].tolist()) == ["d1", "d2"]
+    assert passages["text"].str.contains("Русский").all()
     work = json.loads(
         (tmp_path / "artifacts/work/phase1/candidate_cache.json").read_text(
             encoding="utf-8"
         )
     )
     assert work["dev_top100_action"] == "reused_valid"
+    extraction = work["passage_extraction"]
+    assert extraction["source"]["kind"] == "local_directory"
+    assert extraction["source"]["dataset_script_used"] is False
+    assert extraction["found_docids"] == 2
+    assert extraction["missing_docids"] == 0
+    assert extraction["batches_written"] == 2  # one batch per row, really batched
+    assert extraction["early_stop"] is True  # shard 2 is never opened
+    assert extraction["shards_visited"] == 2
+    assert extraction["lines_visited"] > 2  # non-candidate rows really streamed past
+    assert not (
+        tmp_path / "artifacts/work/phase1/passages.staging.parquet"
+    ).exists()
 
 
 def test_cell11_rejects_partial_candidate_parquets_without_overwrite(

@@ -9,14 +9,19 @@ description = "Reproducible MIRACL Russian BM25 candidate-cache pipeline"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
+    # Phase 1 reads the MIRACL corpus through pinned static JSONL.GZ shards, so
+    # huggingface-hub (not datasets) is the load-bearing dependency. get_paths_info
+    # requires >=0.23; the API used here is stable across 0.x and 1.x.
+    "huggingface-hub>=0.24,<2.0",
+    "pyarrow>=17,<26",
+    "pandas>=2.2,<4.0",
+    "numpy>=1.26,<3.0",
+    "PyYAML>=6.0,<7.0",
+    # datasets is kept for later phases; no Phase 1 code path imports it.
     "datasets>=4.0,<6.0",
     "transformers>=4.41,<6.0",
     "sentence-transformers>=4.0,<6.0",
     "torch>=2.4,<3.0",
-    "pandas>=2.2,<4.0",
-    "pyarrow>=17,<26",
-    "numpy>=1.26,<3.0",
-    "PyYAML>=6.0,<7.0",
     "pytest>=8.0,<10.0",
 ]
 

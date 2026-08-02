@@ -16,10 +16,28 @@ from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 
+from .corpus import MissingCandidatePassagesError
+
 try:
     import certifi
 except ImportError:  # pragma: no cover - datasets normally supplies certifi.
     certifi = None
+
+__all__ = [
+    "CANDIDATE_COLUMNS",
+    "JUDGMENTS",
+    "MissingCandidatePassagesError",
+    "attach_qrels",
+    "download_annotation_files",
+    "extract_passages_from_rows",
+    "inspect_miracl_ru",
+    "load_qrels",
+    "load_topics",
+    "read_candidate_table",
+    "validate_candidate_schema",
+    "validate_passages",
+    "validate_queries",
+]
 
 
 CANDIDATE_COLUMNS = (
@@ -40,32 +58,6 @@ _MIRACL_CORPUS = "miracl/miracl-corpus"
 _HF_API = "https://huggingface.co/api/datasets"
 _HF_RESOLVE = "https://huggingface.co/datasets"
 _HF_ROWS = "https://datasets-server.huggingface.co/rows"
-
-
-class MissingCandidatePassagesError(ValueError):
-    """Candidate docids were absent from the revision-pinned corpus stream."""
-
-    def __init__(
-        self,
-        missing_docids: list[str],
-        *,
-        candidate_context: dict[str, list[dict[str, str]]] | None = None,
-    ) -> None:
-        self.missing_docids = list(missing_docids)
-        details: list[str] = []
-        for docid in self.missing_docids[:10]:
-            locations = (candidate_context or {}).get(docid, [])
-            location_text = ", ".join(
-                f"split={row.get('split')}, query_id={row.get('query_id')}"
-                for row in locations[:3]
-            )
-            details.append(
-                f"docid={docid}" + (f" ({location_text})" if location_text else "")
-            )
-        super().__init__(
-            f"{len(self.missing_docids)} candidate passages missing from corpus; "
-            "first entries: " + "; ".join(details)
-        )
 
 
 def _require_columns(frame: pd.DataFrame, required: set[str], label: str) -> None:
@@ -338,35 +330,6 @@ def extract_passages_from_rows(
     ).astype({"docid": "string", "title": "string", "text": "string"})
     validate_passages(passages)
     return passages
-
-
-def stream_candidate_passages(
-    candidate_docids: set[str],
-    *,
-    dataset_name: str,
-    language: str,
-    revision: str,
-    candidate_context: dict[str, list[dict[str, str]]] | None = None,
-) -> pd.DataFrame:
-    """Stream the official corpus and materialize only requested documents."""
-
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - exercised only by the Linux runner.
-        raise RuntimeError("candidate passage extraction requires the datasets package") from exc
-
-    corpus = load_dataset(
-        dataset_name,
-        language,
-        split="train",
-        revision=revision,
-        streaming=True,
-    )
-    return extract_passages_from_rows(
-        corpus,
-        candidate_docids,
-        candidate_context=candidate_context,
-    )
 
 
 def read_candidate_table(path: str | Path) -> pd.DataFrame:

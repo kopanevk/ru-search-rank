@@ -6,6 +6,38 @@ dataset:
   corpus_revision: d921ec7e349ce0d28daf30b2da9da5ee698bef0d
   annotations_revision: 5be20db9509754dadad47689368639fcec739c00
   corpus_split: train
+  # The official repository still ships a legacy miracl-corpus.py dataset script,
+  # which datasets>=4 refuses to execute. Phase 1 therefore never calls
+  # load_dataset: it downloads these exact static shards from the pinned
+  # revision through huggingface_hub and parses them line by line.
+  corpus_repo_type: dataset
+  corpus_shard_count: 20
+  corpus_shard_files:
+    - miracl-corpus-v1.0-ru/docs-0.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-1.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-2.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-3.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-4.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-5.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-6.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-7.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-8.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-9.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-10.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-11.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-12.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-13.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-14.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-15.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-16.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-17.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-18.jsonl.gz
+    - miracl-corpus-v1.0-ru/docs-19.jsonl.gz
+  corpus_cache_dir: artifacts/work/hf-corpus
+  # Optional offline override: a directory that already holds the same official
+  # shard tree. Leave null so the pinned Hub revision is the single source.
+  corpus_local_dir: null
+  corpus_passage_batch_rows: 50000
   train_topics_path: artifacts/raw/miracl-ru/topics.miracl-v1.0-ru-train.tsv
   topics:
     train: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-train.tsv

@@ -84,9 +84,12 @@ python -m pyserini.search.lucene \
    `https://colab.research.google.com/github/<owner>/<repo>/blob/<branch>/scripts/run_full_bm25_retrieval.ipynb`).
 5. In notebook cell 3, set the public/authorized `REPO_URL` and exact `BRANCH`.
    Never paste a GitHub token into the notebook.
-6. Run cells 1–14 in order. The Python 3.12 test gate, index smoke, train
-   retrieval, dev retrieval, official evaluation, corpus streaming, and
-   packaging are separated. Cell 10 must pass before cell 11 can build cache.
+6. Run cells 1–15 in order; no extra cells are needed. The Python 3.12 test
+   gate, index smoke, train retrieval, dev retrieval, official evaluation, the
+   real corpus smoke, corpus streaming, and packaging are separated. Cell 10
+   (official `trec_eval` gate) must pass before Cell 11, and Cell 11 (REAL
+   COLAB SMOKE against the pinned corpus revision) must pass before Cell 12
+   builds the candidate cache.
 
 ## Retrieve the result
 
