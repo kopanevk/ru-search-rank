@@ -1,0 +1,1313 @@
+"""Phase 0 checks and the guarded Linux/Colab Phase 1A command line."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Sequence
+import zipfile
+
+import pandas as pd
+import yaml
+
+from .data import (
+    CANDIDATE_COLUMNS,
+    download_annotation_files,
+    inspect_miracl_ru,
+    load_qrels,
+    load_topics,
+    read_candidate_table,
+    stream_candidate_passages,
+    validate_candidate_schema,
+    validate_passages,
+    validate_queries,
+)
+from .evaluation import (
+    build_qrels_split_audit,
+    parse_trec_eval_metric,
+    reproduction_rows,
+)
+from .retrieval import (
+    join_qrels,
+    normalize_bm25_run,
+    read_trec_run,
+    smoke_prebuilt_index,
+    validate_query_coverage,
+    validate_stable_order,
+    validate_top_k,
+    write_trec_run,
+)
+
+
+DEFAULT_CHECKPOINT = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+DEFAULT_AUDIT_DIR = Path("reports/audit")
+DEFAULT_RETRIEVAL_CONFIG = Path("configs/retrieval.yaml")
+FULL_RETRIEVAL_ERROR = (
+    "Full retrieval requires Linux, Python 3.12 and Java 21. "
+    "Use scripts/run_full_bm25_retrieval.ipynb."
+)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError(f"JSON file does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected a JSON object: {path}")
+    return payload
+
+
+def _load_retrieval_config(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise ValueError(f"retrieval config does not exist: {config_path}")
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML config: {config_path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("retrieval config must contain a mapping")
+    required = {
+        "dataset",
+        "environment",
+        "retrieval",
+        "artifacts",
+        "audits",
+        "archive",
+        "reproduction_gate",
+    }
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise ValueError(f"retrieval config is missing sections: {', '.join(missing)}")
+    return payload
+
+
+def _java_major_version(output: str) -> int | None:
+    match = re.search(r'(?:version\s+"|openjdk\s+)(\d+)', output.lower())
+    return int(match.group(1)) if match else None
+
+
+def _phase1_environment(config: dict[str, Any]) -> dict[str, Any]:
+    java = _run_capture(["java", "-version"])
+    try:
+        pyserini_version = importlib.metadata.version("pyserini")
+    except importlib.metadata.PackageNotFoundError:
+        pyserini_version = None
+    disk = shutil.disk_usage(Path.cwd())
+    return {
+        "platform": platform.system(),
+        "platform_detail": platform.platform(),
+        "python": platform.python_version(),
+        "python_executable": sys.executable,
+        "java": java,
+        "java_major": _java_major_version(str(java.get("output", ""))),
+        "pyserini": pyserini_version,
+        "cpu_count": os.cpu_count(),
+        "memory_bytes": _memory_bytes(),
+        "disk_free_bytes": disk.free,
+        "required": config["environment"],
+    }
+
+
+def _require_external_environment(config: dict[str, Any]) -> dict[str, Any]:
+    report = _phase1_environment(config)
+    expected = config["environment"]
+    python_expected = tuple(int(part) for part in str(expected["python"]).split("."))
+    python_ok = sys.version_info[:2] == python_expected
+    java_ok = report["java_major"] == int(expected["java"])
+    pyserini_ok = report["pyserini"] == str(expected["pyserini"])
+    disk_required = int(expected["minimum_free_disk_gib"]) * 1024**3
+    disk_ok = int(report["disk_free_bytes"]) >= disk_required
+    if not (
+        platform.system() == "Linux"
+        and python_ok
+        and java_ok
+        and pyserini_ok
+        and disk_ok
+    ):
+        raise RuntimeError(FULL_RETRIEVAL_ERROR)
+    return report
+
+
+def _artifact_path(config: dict[str, Any], key: str) -> Path:
+    return Path(str(config["artifacts"][key]))
+
+
+def _audit_path(config: dict[str, Any], key: str) -> Path:
+    return Path(str(config["audits"][key]))
+
+
+def _ensure_writable_targets(paths: Sequence[Path], *, overwrite: bool) -> None:
+    existing = [str(path) for path in paths if path.exists()]
+    if existing and not overwrite:
+        raise ValueError(
+            "refusing to overwrite existing artifacts without --overwrite: "
+            + ", ".join(existing)
+        )
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _annotation_paths(config: dict[str, Any]) -> dict[str, dict[str, Path]]:
+    dataset = config["dataset"]
+    return download_annotation_files(
+        topics_urls={str(key): str(value) for key, value in dataset["topics"].items()},
+        qrels_urls={str(key): str(value) for key, value in dataset["qrels"].items()},
+        raw_dir=config["paths"]["raw_dir"],
+        expected_rows={str(key): int(value) for key, value in dataset["expected_rows"].items()},
+    )
+
+
+def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_parquet(temporary, index=False)
+    temporary.replace(path)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _print_json(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _run_capture(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "returncode": None, "output": str(exc)}
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    return {
+        "available": result.returncode == 0,
+        "returncode": result.returncode,
+        "output": output,
+    }
+
+
+def _memory_bytes() -> int | None:
+    if platform.system() == "Darwin":
+        sysctl = _run_capture(["sysctl", "-n", "hw.memsize"])
+        if sysctl["available"]:
+            try:
+                return int(sysctl["output"])
+            except ValueError:
+                pass
+        profiler = _run_capture(["system_profiler", "SPHardwareDataType"])
+        match = re.search(r"Memory:\s+([\d.]+)\s+(GB|MB)", profiler["output"])
+        if match:
+            multiplier = 1024**3 if match.group(2) == "GB" else 1024**2
+            return int(float(match.group(1)) * multiplier)
+    if hasattr(os, "sysconf"):
+        try:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except (ValueError, OSError):
+            pass
+    return None
+
+
+def _package_versions() -> dict[str, str | None]:
+    packages = (
+        "datasets",
+        "transformers",
+        "sentence-transformers",
+        "torch",
+        "pandas",
+        "pyarrow",
+        "numpy",
+        "PyYAML",
+        "pytest",
+        "pyserini",
+    )
+    versions: dict[str, str | None] = {}
+    for package in packages:
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def _collect_environment() -> dict[str, Any]:
+    cwd = Path.cwd().resolve()
+    disk = shutil.disk_usage(cwd)
+    git_root = _run_capture(["git", "rev-parse", "--show-toplevel"], cwd)
+    git_branch = _run_capture(["git", "branch", "--show-current"], cwd)
+    git_head = _run_capture(["git", "rev-parse", "HEAD"], cwd)
+    git_status = _run_capture(["git", "status", "--short"], cwd)
+    java = _run_capture(["java", "-version"])
+
+    torch_report: dict[str, Any] = {"installed": importlib.util.find_spec("torch") is not None}
+    if torch_report["installed"]:
+        import torch
+
+        torch_report.update(
+            {
+                "version": torch.__version__,
+                "mps_built": bool(torch.backends.mps.is_built()),
+                "mps_available": bool(torch.backends.mps.is_available()),
+            }
+        )
+    else:
+        torch_report.update({"version": None, "mps_built": None, "mps_available": None})
+
+    return {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "cwd": str(cwd),
+        "git": {
+            "root": git_root["output"] or None,
+            "branch": git_branch["output"] or None,
+            "head": git_head["output"] or None,
+            "status_short": git_status["output"].splitlines() if git_status["output"] else [],
+        },
+        "python": {
+            "version": platform.python_version(),
+            "executable": sys.executable,
+            "python_on_path": shutil.which("python"),
+            "python3_on_path": shutil.which("python3"),
+        },
+        "java": java,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "platform": platform.platform(),
+            "macos_version": platform.mac_ver()[0] or None,
+            "memory_bytes": _memory_bytes(),
+        },
+        "disk": {
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+        },
+        "torch": torch_report,
+        "packages": _package_versions(),
+    }
+
+
+def _environment_report(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    initial_audit: dict[str, Any] | None = None
+    if output.is_file():
+        try:
+            existing = json.loads(output.read_text(encoding="utf-8"))
+            initial_audit = existing.get("initial_audit")
+        except (json.JSONDecodeError, OSError):
+            initial_audit = None
+    payload = {
+        "schema_version": 1,
+        "initial_audit": initial_audit,
+        "latest_audit": _collect_environment(),
+    }
+    _write_json(output, payload)
+    _print_json({"status": "ok", "report": str(output), "environment": payload["latest_audit"]})
+    return 0
+
+
+def _inspect_data(args: argparse.Namespace) -> int:
+    report = inspect_miracl_ru(sample_size=args.sample_size, timeout=args.timeout)
+    output = Path(args.output)
+    _write_json(output, report)
+    _print_json(
+        {
+            "status": "ok",
+            "report": str(output),
+            "corpus_sample_size": report["corpus"]["sample_size"],
+            "train_queries": report["splits"]["train"]["queries"]["row_count"],
+            "dev_queries": report["splits"]["dev"]["queries"]["row_count"],
+            "relevance_values": report["splits"]["dev"]["qrels"]["relevance_values"],
+            "full_corpus_downloaded": False,
+        }
+    )
+    return 0
+
+
+def _model_info_total(safetensors_info: Any) -> int | None:
+    if safetensors_info is None:
+        return None
+    if isinstance(safetensors_info, dict):
+        value = safetensors_info.get("total")
+    else:
+        value = getattr(safetensors_info, "total", None)
+    return int(value) if value is not None else None
+
+
+def _inference_on_device(model: Any, encoded: dict[str, Any], device: str) -> tuple[list[int], list[float]]:
+    import torch
+
+    model.to(device)
+    device_inputs = {name: tensor.to(device) for name, tensor in encoded.items()}
+    with torch.no_grad():
+        logits = model(**device_inputs).logits
+    if device == "mps":
+        torch.mps.synchronize()
+    return list(logits.shape), [float(score) for score in logits.detach().cpu().reshape(-1)]
+
+
+def _inspect_checkpoint(args: argparse.Namespace) -> int:
+    try:
+        import torch
+        from huggingface_hub import HfApi
+        from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "checkpoint inspection requires the project dependencies; run `python -m pip install -e .`"
+        ) from exc
+
+    info = HfApi().model_info(args.checkpoint, revision=args.revision)
+    resolved_revision = info.sha
+    config = AutoConfig.from_pretrained(args.checkpoint, revision=resolved_revision)
+    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, revision=resolved_revision)
+    max_length = min(int(args.max_length), int(tokenizer.model_max_length))
+
+    probe_query = "Какова столица Франции?"
+    probe_document = "Париж\nПариж — столица и крупнейший город Франции."
+    probe_tokens = tokenizer(
+        probe_query,
+        probe_document,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    sep_token_id = tokenizer.sep_token_id
+    sep_count = int(probe_tokens["input_ids"].eq(sep_token_id).sum().item())
+
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checkpoint_name": args.checkpoint,
+        "requested_revision": args.revision,
+        "resolved_revision": resolved_revision,
+        "model_class": config.architectures[0] if config.architectures else None,
+        "tokenizer_class": tokenizer.__class__.__name__,
+        "num_labels": int(config.num_labels),
+        "sep_token": tokenizer.sep_token,
+        "sep_token_id": sep_token_id,
+        "model_max_length": int(tokenizer.model_max_length),
+        "smoke_max_length": max_length,
+        "score_activation": getattr(
+            config, "sbert_ce_default_activation_function", "UNVERIFIED"
+        ),
+        "score_direction": "higher_is_more_relevant",
+        "safetensors_element_count": _model_info_total(getattr(info, "safetensors", None)),
+        "pair_tokenization": {
+            "format": "tokenizer(query, title + '\\n' + text, truncation=True, max_length=...)",
+            "literal_sep_inserted": False,
+            "input_shape": list(probe_tokens["input_ids"].shape),
+            "sep_token_count": sep_count,
+        },
+        "weights_loaded": bool(args.with_model),
+        "parameter_count": None,
+        "word_embeddings_parameter_path": None,
+        "logits_shape": None,
+        "cpu_smoke": {"status": "not_run"},
+        "mps_smoke": {
+            "available": bool(torch.backends.mps.is_available()),
+            "status": "not_run",
+        },
+    }
+
+    if args.with_model:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.checkpoint, revision=resolved_revision
+        )
+        report["model_class"] = model.__class__.__name__
+        report["parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
+        embedding_paths = [
+            name
+            for name, _ in model.named_parameters()
+            if name.endswith("embeddings.word_embeddings.weight")
+        ]
+        if len(embedding_paths) != 1:
+            raise RuntimeError(f"expected one word embedding parameter, found: {embedding_paths}")
+        report["word_embeddings_parameter_path"] = embedding_paths[0]
+
+        pairs = [
+            {
+                "kind": "clearly_relevant",
+                "query": "Какова столица Франции?",
+                "title": "Париж",
+                "text": "Париж — столица и крупнейший город Франции.",
+            },
+            {
+                "kind": "clearly_irrelevant",
+                "query": "Какова столица Франции?",
+                "title": "Яблочный пирог",
+                "text": "Пирог готовят из яблок, муки, масла и сахара.",
+            },
+            {
+                "kind": "neutral",
+                "query": "Какова столица Франции?",
+                "title": "Франция",
+                "text": "Франция — государство в Западной Европе.",
+            },
+        ]
+        encoded = tokenizer(
+            [pair["query"] for pair in pairs],
+            [f"{pair['title']}\n{pair['text']}" for pair in pairs],
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        expected_shape = [len(pairs), int(config.num_labels)]
+        cpu_shape, cpu_scores = _inference_on_device(model, encoded, "cpu")
+        finite = all(np_value == np_value and abs(np_value) != float("inf") for np_value in cpu_scores)
+        distinct = len({round(score, 7) for score in cpu_scores}) > 1
+        direction_ok = cpu_scores[0] > cpu_scores[1]
+        if cpu_shape != expected_shape:
+            raise RuntimeError(f"unexpected logits shape: {cpu_shape}, expected {expected_shape}")
+        if not finite or not distinct:
+            raise RuntimeError("checkpoint smoke scores must be finite and not all identical")
+
+        report["logits_shape"] = cpu_shape
+        report["cpu_smoke"] = {
+            "status": "passed",
+            "scores": {
+                pair["kind"]: score for pair, score in zip(pairs, cpu_scores, strict=True)
+            },
+            "finite": finite,
+            "not_all_identical": distinct,
+            "higher_is_more_relevant_check": direction_ok,
+        }
+        if not direction_ok:
+            raise RuntimeError("relevant smoke pair did not score above the irrelevant pair")
+
+        if torch.backends.mps.is_available():
+            try:
+                mps_shape, mps_scores = _inference_on_device(model, encoded, "mps")
+                mps_finite = all(
+                    value == value and abs(value) != float("inf") for value in mps_scores
+                )
+                if mps_shape != expected_shape or not mps_finite:
+                    raise RuntimeError("MPS returned an invalid shape or non-finite scores")
+                report["mps_smoke"] = {
+                    "available": True,
+                    "status": "passed",
+                    "logits_shape": mps_shape,
+                    "scores": {
+                        pair["kind"]: score
+                        for pair, score in zip(pairs, mps_scores, strict=True)
+                    },
+                }
+            except Exception as exc:  # The failure is preserved in the audit artifact.
+                report["mps_smoke"] = {
+                    "available": True,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+        else:
+            report["mps_smoke"] = {
+                "available": False,
+                "status": "skipped",
+                "reason": "torch.backends.mps.is_available() is false",
+            }
+
+    output = Path(args.output)
+    _write_json(output, report)
+    _print_json(
+        {
+            "status": "ok",
+            "report": str(output),
+            "resolved_revision": resolved_revision,
+            "weights_loaded": report["weights_loaded"],
+            "cpu_smoke": report["cpu_smoke"]["status"],
+            "mps_smoke": report["mps_smoke"]["status"],
+        }
+    )
+    return 0
+
+
+def _validate_candidates(args: argparse.Namespace) -> int:
+    candidates = read_candidate_table(args.path)
+    validate_candidate_schema(candidates)
+    config = _load_retrieval_config(args.config)
+    top_k = int(config["retrieval"]["candidate_depth"])
+    validate_top_k(candidates, top_k)
+    validate_stable_order(candidates)
+
+    queries_path = _artifact_path(config, "queries")
+    passages_path = _artifact_path(config, "passages")
+    coverage: dict[str, Any] = {"queries": "not_checked", "passages": "not_checked"}
+    if queries_path.is_file():
+        queries = pd.read_parquet(queries_path)
+        validate_queries(queries)
+        split_values = candidates["split"].astype("string").drop_duplicates().tolist()
+        expected = queries.loc[queries["split"].astype("string").isin(split_values)]
+        validate_query_coverage(candidates, expected)
+        coverage["queries"] = "complete"
+    if passages_path.is_file():
+        passages = pd.read_parquet(passages_path)
+        validate_passages(passages)
+        missing_docids = set(candidates["docid"].astype("string")).difference(
+            passages["docid"].astype("string")
+        )
+        if missing_docids:
+            raise ValueError(f"candidate passages are missing: {sorted(missing_docids)[:10]}")
+        coverage["passages"] = "complete"
+
+    counts = candidates["judgment"].value_counts().to_dict()
+    payload = {
+        "status": "valid",
+        "path": str(Path(args.path).resolve()),
+        "rows": int(len(candidates)),
+        "queries": int(candidates["query_id"].nunique()),
+        "top_k": top_k,
+        "stable_sorting": "valid",
+        "coverage": coverage,
+        "judgment_counts": {str(key): int(value) for key, value in counts.items()},
+    }
+    _print_json(payload)
+    return 0
+
+
+def _inspect_linux_environment(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    report = _phase1_environment(config)
+    try:
+        _require_external_environment(config)
+    except RuntimeError:
+        _print_json({"status": "failed", "environment": report, "error": FULL_RETRIEVAL_ERROR})
+        raise
+
+    payload: dict[str, Any] = {"status": "valid", "environment": report}
+    if args.check_index:
+        payload["index_smoke"] = smoke_prebuilt_index(
+            index_name=str(config["retrieval"]["index_name"]),
+            language=str(config["dataset"]["language"]),
+            query_text="Когда начался Карибский кризис?",
+        )
+    _print_json(payload)
+    return 0
+
+
+def _run_bm25(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    environment = _require_external_environment(config)
+    splits = list(config["splits"]) if args.split == "all" else [args.split]
+    run_keys = {"train": "train_run", "dev": "dev_run"}
+    targets = [_artifact_path(config, run_keys[split]) for split in splits]
+    _ensure_writable_targets(targets, overwrite=args.overwrite)
+    annotation_paths = _annotation_paths(config)
+
+    results: dict[str, Any] = {}
+    for split, target in zip(splits, targets, strict=True):
+        queries = load_topics(annotation_paths[split]["topics"], split=split)
+        retrieval_hits = int(config["retrieval"]["retrieval_hits"][split])
+        official_topic = f"miracl-v1.0-ru-{split}"
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        command = [
+            sys.executable,
+            "-m",
+            "pyserini.search.lucene",
+            "--threads",
+            str(config["retrieval"]["threads"]),
+            "--batch-size",
+            str(config["retrieval"]["batch_size"]),
+            "--language",
+            str(config["dataset"]["language"]),
+            "--topics",
+            official_topic,
+            "--index",
+            str(config["retrieval"]["index_name"]),
+            "--output",
+            str(temporary),
+            "--bm25",
+            "--hits",
+            str(retrieval_hits),
+        ]
+        started = time.perf_counter()
+        result = subprocess.run(
+            command,
+            cwd=Path.cwd(),
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            temporary.unlink(missing_ok=True)
+            output = "\n".join(
+                part.strip() for part in (result.stdout, result.stderr) if part.strip()
+            )
+            raise RuntimeError(f"official Pyserini retrieval failed: {output}")
+        elapsed = time.perf_counter() - started
+        if not temporary.is_file():
+            raise RuntimeError("official Pyserini retrieval did not create its run file")
+        raw_run = read_trec_run(str(temporary), split=split)
+        validated = normalize_bm25_run(
+            raw_run[["split", "query_id", "docid", "bm25_score"]],
+            top_k=retrieval_hits,
+        )
+        validate_top_k(validated, retrieval_hits)
+        validate_query_coverage(validated, queries)
+        # Preserve Pyserini's raw output byte-for-byte for official evaluation.
+        temporary.replace(target)
+        work_path = Path(config["paths"]["work_dir"]) / f"retrieval_{split}.json"
+        _write_json(
+            work_path,
+            {
+                "split": split,
+                "seconds": elapsed,
+                "queries": int(len(queries)),
+                "rows": int(len(raw_run)),
+                "hits_per_query": retrieval_hits,
+                "official_topic": official_topic,
+                "command": command,
+                "run": str(target),
+            },
+        )
+        results[split] = {
+            "run": str(target),
+            "queries": int(len(queries)),
+            "rows": int(len(raw_run)),
+            "hits_per_query": retrieval_hits,
+            "seconds": elapsed,
+        }
+    _print_json({"status": "ok", "retrieval": results})
+    return 0
+
+
+def _stable_truncate_trec_run(
+    source: Path,
+    target: Path,
+    *,
+    split: str,
+    top_k: int,
+) -> pd.DataFrame:
+    """Write a separate deterministic top-k run without mutating its source."""
+
+    source_hash = _sha256(source)
+    raw = read_trec_run(str(source), split=split)
+    normalized = normalize_bm25_run(
+        raw[["split", "query_id", "docid", "bm25_score"]],
+        top_k=top_k,
+    )
+    validate_top_k(normalized, top_k)
+    validate_stable_order(normalized)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    write_trec_run(
+        normalized,
+        str(temporary),
+        tag="rusearchrank-stable-top100",
+    )
+    if _sha256(source) != source_hash:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("source dev top-1000 run changed during stable truncation")
+    temporary.replace(target)
+    # Candidate scores and ranks come from the exact portable top-k file.
+    portable = read_trec_run(str(target), split=split)
+    portable = normalize_bm25_run(
+        portable[["split", "query_id", "docid", "bm25_score"]],
+        top_k=top_k,
+    )
+    validate_top_k(portable, top_k)
+    validate_stable_order(portable)
+    return portable
+
+
+def _build_candidate_cache(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    _require_external_environment(config)
+    reproduction = _read_json(_audit_path(config, "reproduction"))
+    if reproduction.get("status") != "PASS" or reproduction.get("gate_passed") is not True:
+        raise ValueError(
+            "candidate cache requires a passed official dev reproduction gate"
+        )
+    dev_run_path = _artifact_path(config, "dev_run")
+    if reproduction.get("source_run") != str(dev_run_path):
+        raise ValueError(
+            "candidate cache requires an audit of the configured dev top-1000 run"
+        )
+    if reproduction.get("source_run_sha256") != _sha256(dev_run_path):
+        raise ValueError(
+            "candidate cache requires a reproduction gate for the current dev run"
+        )
+    dev_source_hash = _sha256(dev_run_path)
+    dev_top100_path = _artifact_path(config, "dev_top100_run")
+    train_candidates_path = _artifact_path(config, "train_candidates")
+    dev_candidates_path = _artifact_path(config, "dev_candidates")
+    queries_path = _artifact_path(config, "queries")
+    passages_path = _artifact_path(config, "passages")
+    output_paths = [
+        dev_top100_path,
+        train_candidates_path,
+        dev_candidates_path,
+        queries_path,
+        passages_path,
+    ]
+    _ensure_writable_targets(output_paths, overwrite=args.overwrite)
+    annotation_paths = _annotation_paths(config)
+    top_k = int(config["retrieval"]["candidate_depth"])
+    dev_top100 = _stable_truncate_trec_run(
+        dev_run_path,
+        dev_top100_path,
+        split="dev",
+        top_k=top_k,
+    )
+    if _sha256(dev_run_path) != dev_source_hash:
+        raise RuntimeError("dev top-1000 run was modified after reproduction")
+
+    candidate_frames: dict[str, pd.DataFrame] = {}
+    query_frames: list[pd.DataFrame] = []
+    for split in ("train", "dev"):
+        queries = load_topics(annotation_paths[split]["topics"], split=split)
+        qrels = load_qrels(annotation_paths[split]["qrels"], split=split)
+        if split == "dev":
+            normalized = dev_top100
+        else:
+            run_path = _artifact_path(config, "train_run")
+            if not run_path.is_file():
+                raise ValueError(f"BM25 run does not exist: {run_path}")
+            raw_run = read_trec_run(str(run_path), split=split)
+            normalized = normalize_bm25_run(
+                raw_run[["split", "query_id", "docid", "bm25_score"]],
+                top_k=top_k,
+            )
+        validate_top_k(normalized, top_k)
+        validate_query_coverage(normalized, queries)
+        candidates = join_qrels(normalized, qrels)
+        candidates = candidates.loc[:, list(CANDIDATE_COLUMNS)]
+        validate_candidate_schema(candidates)
+        candidate_frames[split] = candidates
+        query_frames.append(queries)
+
+    queries = pd.concat(query_frames, ignore_index=True)
+    validate_queries(queries)
+    candidate_docids = set(
+        pd.concat(
+            [frame["docid"] for frame in candidate_frames.values()], ignore_index=True
+        ).astype("string")
+    )
+    extraction_started = time.perf_counter()
+    passages = stream_candidate_passages(
+        candidate_docids,
+        dataset_name=str(config["dataset"]["corpus_source"]),
+        language=str(config["dataset"]["language"]),
+        revision=str(config["dataset"]["corpus_revision"]),
+    )
+    extraction_seconds = time.perf_counter() - extraction_started
+    validate_passages(passages)
+    if set(passages["docid"].astype("string")) != candidate_docids:
+        raise ValueError("passage extraction did not produce exact candidate coverage")
+
+    _atomic_parquet(candidate_frames["train"], train_candidates_path)
+    _atomic_parquet(candidate_frames["dev"], dev_candidates_path)
+    _atomic_parquet(queries, queries_path)
+    _atomic_parquet(passages, passages_path)
+    work_path = Path(config["paths"]["work_dir"]) / "candidate_cache.json"
+    _write_json(
+        work_path,
+        {
+            "passage_extraction_seconds": extraction_seconds,
+            "unique_passages": int(len(passages)),
+            "train_rows": int(len(candidate_frames["train"])),
+            "dev_rows": int(len(candidate_frames["dev"])),
+            "dev_top1000_run": str(dev_run_path),
+            "dev_top1000_sha256": dev_source_hash,
+            "dev_top100_run": str(dev_top100_path),
+            "dev_top100_sha256": _sha256(dev_top100_path),
+        },
+    )
+    _print_json(
+        {
+            "status": "ok",
+            "train_rows": int(len(candidate_frames["train"])),
+            "dev_rows": int(len(candidate_frames["dev"])),
+            "queries": int(len(queries)),
+            "unique_passages": int(len(passages)),
+            "passage_extraction_seconds": extraction_seconds,
+        }
+    )
+    return 0
+
+
+def _run_trec_eval(arguments: list[str]) -> str:
+    result = subprocess.run(
+        [sys.executable, "-m", "pyserini.eval.trec_eval", *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        raise RuntimeError(f"official Pyserini evaluation failed: {output.strip()}")
+    return result.stdout
+
+
+def _evaluate_bm25(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    environment = _require_external_environment(config)
+    output = _audit_path(config, "reproduction")
+    _ensure_writable_targets([output], overwrite=args.overwrite)
+    topic = str(config["reproduction_gate"]["official_topic"])
+    dev_run_path = _artifact_path(config, "dev_run")
+    if not dev_run_path.is_file():
+        raise ValueError(f"official dev top-1000 run does not exist: {dev_run_path}")
+    run_path = str(dev_run_path)
+    source_run_sha256 = _sha256(dev_run_path)
+    source_run_size_bytes = dev_run_path.stat().st_size
+
+    # The official tool evaluates the untouched 1,000-hit dev run first.
+    ndcg_stdout = _run_trec_eval(
+        ["-c", "-M", "100", "-m", "ndcg_cut.10", topic, run_path]
+    )
+    recall_stdout = _run_trec_eval(["-c", "-m", "recall.100", topic, run_path])
+    official_tool = {
+        "ndcg_at_10": parse_trec_eval_metric(ndcg_stdout, "ndcg_cut_10"),
+        "recall_at_100": parse_trec_eval_metric(recall_stdout, "recall_100"),
+    }
+    if (
+        _sha256(dev_run_path) != source_run_sha256
+        or dev_run_path.stat().st_size != source_run_size_bytes
+    ):
+        raise RuntimeError("official dev top-1000 run changed during evaluation")
+
+    published = {
+        "ndcg_at_10": float(config["reproduction_gate"]["official_ndcg_at_10"]),
+        "recall_at_100": float(
+            config["reproduction_gate"]["official_recall_at_100"]
+        ),
+    }
+    tolerances = {
+        "ndcg_at_10": float(
+            config["reproduction_gate"]["ndcg_at_10_tolerance"]
+        ),
+        "recall_at_100": float(
+            config["reproduction_gate"]["recall_at_100_tolerance"]
+        ),
+    }
+    rows = reproduction_rows(official=published, local=official_tool, tolerances=tolerances)
+    gate_passed = all(row["status"] == "PASS" for row in rows)
+    payload = {
+        "status": "PASS" if gate_passed else "FAIL",
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "official_source": config["sources"]["pyserini_miracl_2cr"],
+        "official_commands": {
+            "retrieval": config["reproduction_gate"]["official_retrieval_command"],
+            "ndcg": config["reproduction_gate"]["official_ndcg_command"],
+            "recall": config["reproduction_gate"]["official_recall_command"],
+        },
+        "environment": {
+            "python": environment["python"],
+            "java_major": environment["java_major"],
+            "pyserini": environment["pyserini"],
+        },
+        "metrics": rows,
+        "source_run": str(dev_run_path),
+        "source_run_sha256": source_run_sha256,
+        "source_run_size_bytes": source_run_size_bytes,
+        "source_run_hits_per_query": int(
+            config["retrieval"]["retrieval_hits"]["dev"]
+        ),
+        "candidate_depth_after_reproduction": int(
+            config["retrieval"]["candidate_depth"]
+        ),
+        "official_tool_values": official_tool,
+        "gate_passed": gate_passed,
+    }
+    _write_json(output, payload)
+    _print_json(payload)
+    return 0 if gate_passed else 1
+
+
+def _audit_qrels(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    output = _audit_path(config, "qrels")
+    _ensure_writable_targets([output], overwrite=args.overwrite)
+    annotation_paths = _annotation_paths(config)
+    queries = pd.read_parquet(_artifact_path(config, "queries"))
+    validate_queries(queries)
+    split_reports: dict[str, Any] = {}
+    for split in ("train", "dev"):
+        split_queries = queries.loc[queries["split"].astype("string").eq(split)]
+        qrels = load_qrels(annotation_paths[split]["qrels"], split=split)
+        candidates = read_candidate_table(_artifact_path(config, f"{split}_candidates"))
+        validate_candidate_schema(candidates)
+        split_reports[split] = build_qrels_split_audit(
+            queries=split_queries,
+            qrels=qrels,
+            candidates=candidates,
+        )
+    payload = {
+        "status": "COMPLETED",
+        "audited_at": datetime.now(timezone.utc).isoformat(),
+        "annotations_revision": config["dataset"]["annotations_revision"],
+        "splits": split_reports,
+        "max_judged_negatives_recommendation": None,
+        "note": "No training-sampling decision is made in Phase 1A.",
+    }
+    _write_json(output, payload)
+    _print_json(payload)
+    return 0
+
+
+def _package_phase1(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    archive_path = Path(str(config["archive"]["path"]))
+    manifest_path = _audit_path(config, "manifest")
+    _ensure_writable_targets([archive_path, manifest_path], overwrite=args.overwrite)
+
+    reproduction_path = _audit_path(config, "reproduction")
+    qrels_path = _audit_path(config, "qrels")
+    reproduction = _read_json(reproduction_path)
+    qrels_audit = _read_json(qrels_path)
+    dev_top1000_path = _artifact_path(config, "dev_run")
+    dev_top100_path = _artifact_path(config, "dev_top100_run")
+    train_run_path = _artifact_path(config, "train_run")
+    if reproduction.get("status") != "PASS" or reproduction.get("gate_passed") is not True:
+        raise ValueError("a passed official reproduction gate is required before packaging")
+    if reproduction.get("source_run") != str(dev_top1000_path):
+        raise ValueError("reproduction audit does not identify the configured dev top-1000 run")
+    if reproduction.get("source_run_sha256") != _sha256(dev_top1000_path):
+        raise ValueError("dev top-1000 run no longer matches its reproduction audit")
+    if qrels_audit.get("status") != "COMPLETED":
+        raise ValueError("a completed qrels audit is required before packaging")
+    if not bool(config["archive"].get("include_runs", False)):
+        raise ValueError("Phase 1A archive must include all provenance runs")
+
+    candidates = {
+        split: read_candidate_table(_artifact_path(config, f"{split}_candidates"))
+        for split in ("train", "dev")
+    }
+    for frame in candidates.values():
+        validate_candidate_schema(frame)
+        validate_top_k(frame, int(config["retrieval"]["candidate_depth"]))
+        validate_stable_order(frame)
+    queries = pd.read_parquet(_artifact_path(config, "queries"))
+    passages = pd.read_parquet(_artifact_path(config, "passages"))
+    validate_queries(queries)
+    validate_passages(passages)
+    all_docids = set(
+        pd.concat([frame["docid"] for frame in candidates.values()]).astype("string")
+    )
+    if all_docids != set(passages["docid"].astype("string")):
+        raise ValueError("passages.parquet does not exactly cover candidate docids")
+    for split, frame in candidates.items():
+        expected = queries.loc[queries["split"].astype("string").eq(split)]
+        validate_query_coverage(frame, expected)
+
+    top_k = int(config["retrieval"]["candidate_depth"])
+    raw_dev = read_trec_run(str(dev_top1000_path), split="dev")
+    expected_dev_top100 = normalize_bm25_run(
+        raw_dev[["split", "query_id", "docid", "bm25_score"]], top_k=top_k
+    )
+    portable_dev = read_trec_run(str(dev_top100_path), split="dev")
+    actual_dev_top100 = normalize_bm25_run(
+        portable_dev[["split", "query_id", "docid", "bm25_score"]], top_k=top_k
+    )
+    validate_top_k(actual_dev_top100, top_k)
+    validate_stable_order(actual_dev_top100)
+    run_columns = ["split", "query_id", "docid", "bm25_rank", "bm25_score"]
+    if not expected_dev_top100[run_columns].equals(actual_dev_top100[run_columns]):
+        raise ValueError("dev top-100 run is not the stable truncation of dev top-1000")
+    candidate_core = candidates["dev"][run_columns].reset_index(drop=True).copy()
+    for column in ("split", "query_id", "docid"):
+        candidate_core[column] = candidate_core[column].astype("string")
+    candidate_core["bm25_rank"] = candidate_core["bm25_rank"].astype("int64")
+    candidate_core["bm25_score"] = candidate_core["bm25_score"].astype("float64")
+    if not candidate_core.equals(actual_dev_top100[run_columns]):
+        raise ValueError("dev candidate cache does not match the portable dev top-100 run")
+
+    payload_paths = [
+        dev_top1000_path,
+        dev_top100_path,
+        train_run_path,
+        _artifact_path(config, "train_candidates"),
+        _artifact_path(config, "dev_candidates"),
+        _artifact_path(config, "queries"),
+        _artifact_path(config, "passages"),
+        reproduction_path,
+        qrels_path,
+    ]
+    missing = [str(path) for path in payload_paths if not path.is_file()]
+    if missing:
+        raise ValueError(f"phase1 package inputs are missing: {', '.join(missing)}")
+
+    work_dir = Path(config["paths"]["work_dir"])
+    timings: dict[str, Any] = {}
+    for name in ("retrieval_train", "retrieval_dev", "candidate_cache"):
+        path = work_dir / f"{name}.json"
+        if path.is_file():
+            timings[name] = _read_json(path)
+    text_lengths = passages["text"].astype("string").str.len()
+    runtime_environment = _phase1_environment(config)
+    manifest = {
+        "status": "PASS",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "dataset": {
+            "name": config["dataset"]["name"],
+            "language": config["dataset"]["language"],
+            "corpus_revision": config["dataset"]["corpus_revision"],
+            "annotations_revision": config["dataset"]["annotations_revision"],
+        },
+        "retrieval": {
+            "engine": config["retrieval"]["engine"],
+            "index_name": config["retrieval"]["index_name"],
+            "analyzer": config["retrieval"]["analyzer"],
+            "candidate_depth": config["retrieval"]["candidate_depth"],
+            "retrieval_hits": config["retrieval"]["retrieval_hits"],
+            "threads": config["retrieval"]["threads"],
+            "batch_size": config["retrieval"]["batch_size"],
+            "bm25_k1": config["retrieval"]["bm25_k1"],
+            "bm25_b": config["retrieval"]["bm25_b"],
+            "official_command": config["reproduction_gate"][
+                "official_retrieval_command"
+            ],
+            "actual_command": (
+                "python -m rusearchrank.cli run-bm25 "
+                "--config configs/retrieval.yaml --split {train|dev}"
+            ),
+        },
+        "environment": {
+            "platform": runtime_environment["platform"],
+            "platform_detail": runtime_environment["platform_detail"],
+            "python": runtime_environment["python"],
+            "java_major": runtime_environment["java_major"],
+            "java_version_output": runtime_environment["java"]["output"],
+            "pyserini": runtime_environment["pyserini"],
+            "cpu_count": runtime_environment["cpu_count"],
+            "memory_bytes": runtime_environment["memory_bytes"],
+        },
+        "git": {
+            "head": _run_capture(["git", "rev-parse", "HEAD"])["output"] or None,
+            "branch": _run_capture(["git", "branch", "--show-current"])["output"] or None,
+        },
+        "scale": {
+            "train_queries": int(candidates["train"]["query_id"].nunique()),
+            "dev_queries": int(candidates["dev"]["query_id"].nunique()),
+            "train_candidate_rows": int(len(candidates["train"])),
+            "dev_candidate_rows": int(len(candidates["dev"])),
+            "unique_passages": int(len(passages)),
+        },
+        "passages": {
+            "fraction_with_title": float(passages["title"].astype("string").ne("").mean()),
+            "empty_titles": int(passages["title"].astype("string").eq("").sum()),
+            "text_length_characters": {
+                "min": int(text_lengths.min()),
+                "median": float(text_lengths.median()),
+                "p90": float(text_lengths.quantile(0.9)),
+                "max": int(text_lengths.max()),
+            },
+        },
+        "official_values": {
+            "ndcg_at_10": config["reproduction_gate"]["official_ndcg_at_10"],
+            "recall_at_100": config["reproduction_gate"]["official_recall_at_100"],
+        },
+        "local_values": reproduction.get("official_tool_values"),
+        "gate_passed": True,
+        "provenance_chain": {
+            "flow": [
+                "dev top-1000 run",
+                "official evaluation PASS",
+                "stable truncation (bm25_score DESC, docid ASC; ranks 1..100)",
+                "dev top-100 run",
+                "three-state candidate cache",
+            ],
+            "dev_top1000": {
+                "path": str(dev_top1000_path),
+                "sha256": _sha256(dev_top1000_path),
+                "size_bytes": dev_top1000_path.stat().st_size,
+            },
+            "reproduction_audit": {
+                "path": str(reproduction_path),
+                "status": reproduction["status"],
+                "source_run_sha256": reproduction["source_run_sha256"],
+            },
+            "dev_top100": {
+                "path": str(dev_top100_path),
+                "sha256": _sha256(dev_top100_path),
+                "size_bytes": dev_top100_path.stat().st_size,
+            },
+            "candidate_cache": {
+                "train": str(_artifact_path(config, "train_candidates")),
+                "dev": str(_artifact_path(config, "dev_candidates")),
+                "judgment_states": ["relevant", "non_relevant", "unjudged"],
+            },
+        },
+        "timings": timings,
+        "artifacts": [
+            {
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+            for path in payload_paths
+        ],
+    }
+    _write_json(manifest_path, manifest)
+    archive_inputs = [*payload_paths, manifest_path]
+    temporary_archive = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    with zipfile.ZipFile(
+        temporary_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as archive:
+        for path in archive_inputs:
+            archive.write(path, arcname=path.as_posix())
+    expected_archive_names = [path.as_posix() for path in archive_inputs]
+    with zipfile.ZipFile(temporary_archive) as archive:
+        if archive.namelist() != expected_archive_names:
+            temporary_archive.unlink(missing_ok=True)
+            raise RuntimeError("ZIP contents do not match the exact Phase 1A allowlist")
+    temporary_archive.replace(archive_path)
+    _print_json(
+        {
+            "status": "ok",
+            "archive": str(archive_path),
+            "size_bytes": archive_path.stat().st_size,
+            "sha256": _sha256(archive_path),
+            "contents": [path.as_posix() for path in archive_inputs],
+        }
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m rusearchrank.cli",
+        description="RuSearchRank Phase 0 checks and guarded Phase 1A retrieval",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    data_parser = subparsers.add_parser(
+        "inspect-data", help="inspect small official MIRACL Russian samples"
+    )
+    data_parser.add_argument("--sample-size", type=int, default=3)
+    data_parser.add_argument("--timeout", type=float, default=30.0)
+    data_parser.add_argument(
+        "--output", default=str(DEFAULT_AUDIT_DIR / "miracl_schema.json")
+    )
+    data_parser.set_defaults(func=_inspect_data)
+
+    checkpoint_parser = subparsers.add_parser(
+        "inspect-checkpoint", help="inspect tokenizer/config and optionally run model inference"
+    )
+    checkpoint_parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    checkpoint_parser.add_argument("--revision", default="main")
+    checkpoint_parser.add_argument("--max-length", type=int, default=256)
+    checkpoint_parser.add_argument(
+        "--with-model",
+        action="store_true",
+        help="download model weights and run CPU/MPS inference",
+    )
+    checkpoint_parser.add_argument(
+        "--output", default=str(DEFAULT_AUDIT_DIR / "checkpoint_contract.json")
+    )
+    checkpoint_parser.set_defaults(func=_inspect_checkpoint)
+
+    validation_parser = subparsers.add_parser(
+        "validate-candidates", help="validate a CSV, TSV, or Parquet candidate table"
+    )
+    validation_parser.add_argument("path")
+    validation_parser.add_argument(
+        "--config", default=str(DEFAULT_RETRIEVAL_CONFIG)
+    )
+    validation_parser.set_defaults(func=_validate_candidates)
+
+    environment_parser = subparsers.add_parser(
+        "environment-report", help="capture Python, Java, platform, disk, and MPS facts"
+    )
+    environment_parser.add_argument(
+        "--output", default=str(DEFAULT_AUDIT_DIR / "environment.json")
+    )
+    environment_parser.set_defaults(func=_environment_report)
+
+    linux_parser = subparsers.add_parser(
+        "inspect-linux-environment",
+        help="validate the exact external retrieval environment",
+    )
+    linux_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    linux_parser.add_argument(
+        "--check-index",
+        action="store_true",
+        help="download/open the official index and run one smoke query",
+    )
+    linux_parser.set_defaults(func=_inspect_linux_environment)
+
+    bm25_parser = subparsers.add_parser(
+        "run-bm25", help="run guarded full Pyserini BM25 retrieval"
+    )
+    bm25_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    bm25_parser.add_argument(
+        "--split", choices=("train", "dev", "all"), default="all"
+    )
+    bm25_parser.add_argument("--overwrite", action="store_true")
+    bm25_parser.set_defaults(func=_run_bm25)
+
+    cache_parser = subparsers.add_parser(
+        "build-candidate-cache",
+        help="join qrels and stream only top-100 candidate passages",
+    )
+    cache_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    cache_parser.add_argument("--overwrite", action="store_true")
+    cache_parser.set_defaults(func=_build_candidate_cache)
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate-bm25", help="compare internal metrics with official Pyserini evaluation"
+    )
+    evaluate_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    evaluate_parser.add_argument("--overwrite", action="store_true")
+    evaluate_parser.set_defaults(func=_evaluate_bm25)
+
+    audit_parser = subparsers.add_parser(
+        "audit-qrels", help="write qrels and candidate-coverage audit"
+    )
+    audit_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    audit_parser.add_argument("--overwrite", action="store_true")
+    audit_parser.set_defaults(func=_audit_qrels)
+
+    package_parser = subparsers.add_parser(
+        "package-phase1", help="validate and package only portable Phase 1 results"
+    )
+    package_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    package_parser.add_argument("--overwrite", action="store_true")
+    package_parser.set_defaults(func=_package_phase1)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rusearchrank"
+version = "0.1.0"
+description = "Reproducible MIRACL Russian BM25 candidate-cache pipeline"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "datasets>=4.0,<6.0",
+    "transformers>=4.41,<6.0",
+    "sentence-transformers>=4.0,<6.0",
+    "torch>=2.4,<3.0",
+    "pandas>=2.2,<4.0",
+    "pyarrow>=17,<26",
+    "numpy>=1.26,<3.0",
+    "PyYAML>=6.0,<7.0",
+    "pytest>=8.0,<10.0",
+]
+
+[project.optional-dependencies]
+retrieval = ["pyserini==2.3.0"]
+
+[project.scripts]
+rusearchrank = "rusearchrank.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

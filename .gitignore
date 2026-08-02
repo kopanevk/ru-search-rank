@@ -1,0 +1,27 @@
+.DS_Store
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+build/
+dist/
+
+# Candidate caches are reproducible artifacts, not source files.
+artifacts/candidates/*
+artifacts/raw/
+artifacts/runs/
+artifacts/work/
+artifacts/*.zip
+*.trec
+
+# Full retrieval caches and indexes must remain external.
+indexes/
+lucene-index*/
+.pyserini/
+
+# Local Hugging Face caches must not enter the repository.
+.cache/
+hf_cache/

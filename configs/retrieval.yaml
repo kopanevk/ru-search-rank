@@ -1,0 +1,101 @@
+dataset:
+  name: miracl
+  language: ru
+  corpus_source: miracl/miracl-corpus
+  annotations_source: miracl/miracl
+  corpus_revision: d921ec7e349ce0d28daf30b2da9da5ee698bef0d
+  annotations_revision: 5be20db9509754dadad47689368639fcec739c00
+  corpus_split: train
+  topics:
+    train: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-train.tsv
+    dev: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-dev.tsv
+  qrels:
+    train: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/qrels/qrels.miracl-v1.0-ru-train.tsv
+    dev: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/qrels/qrels.miracl-v1.0-ru-dev.tsv
+  expected_rows:
+    train_queries: 4683
+    dev_queries: 1252
+    train_qrels: 33921
+    dev_qrels: 13100
+
+environment:
+  platform: linux
+  python: "3.12"
+  java: "21"
+  pyserini: "2.3.0"
+  minimum_free_disk_gib: 30
+
+retrieval:
+  engine: pyserini_lucene
+  index_name: miracl-v1.0-ru
+  analyzer: Lucene RussianAnalyzer via --language ru
+  candidate_depth: 100
+  retrieval_hits:
+    train: 100
+    dev: 1000
+  threads: 16
+  batch_size: 128
+  bm25_k1: 0.9
+  bm25_b: 0.4
+
+splits:
+  - train
+  - dev
+
+sorting:
+  primary: bm25_score_desc
+  secondary: docid_asc
+
+paths:
+  raw_dir: artifacts/raw/miracl-ru
+  work_dir: artifacts/work/phase1
+
+artifacts:
+  train_run: artifacts/runs/train_bm25_top100.trec
+  dev_run: artifacts/runs/dev_bm25_top1000.trec
+  dev_top100_run: artifacts/runs/dev_bm25_top100.trec
+  train_candidates: artifacts/candidates/train_top100.parquet
+  dev_candidates: artifacts/candidates/dev_top100.parquet
+  queries: artifacts/candidates/queries.parquet
+  passages: artifacts/candidates/passages.parquet
+
+audits:
+  reproduction: reports/audit/bm25_reproduction.json
+  qrels: reports/audit/qrels_audit.json
+  manifest: reports/audit/candidate_cache_manifest.json
+
+reproduction_gate:
+  official_topic: miracl-v1.0-ru-dev
+  official_ndcg_at_10: 0.334
+  official_recall_at_100: 0.661
+  ndcg_at_10_tolerance: 0.002
+  recall_at_100_tolerance: 0.005
+  official_retrieval_command: >-
+    python -m pyserini.search.lucene --threads 16 --batch-size 128
+    --language ru --topics miracl-v1.0-ru-dev --index miracl-v1.0-ru
+    --output run.miracl.bm25.ru.dev.txt --bm25 --hits 1000
+  official_ndcg_command: >-
+    python -m pyserini.eval.trec_eval -c -M 100 -m ndcg_cut.10
+    miracl-v1.0-ru-dev run.miracl.bm25.ru.dev.txt
+  official_recall_command: >-
+    python -m pyserini.eval.trec_eval -c -m recall.100
+    miracl-v1.0-ru-dev run.miracl.bm25.ru.dev.txt
+
+archive:
+  path: artifacts/rusearchrank_phase1_results.zip
+  include_runs: true
+
+sources:
+  miracl_repository: https://github.com/project-miracl/miracl
+  miracl_annotations: https://huggingface.co/datasets/miracl/miracl
+  miracl_corpus: https://huggingface.co/datasets/miracl/miracl-corpus
+  pyserini_miracl_2cr: https://castorini.github.io/pyserini/2cr/miracl.html
+  pyserini_prebuilt_indexes: https://github.com/castorini/pyserini/blob/master/docs/prebuilt-indexes.md
+  pyserini_release: https://pypi.org/project/pyserini/2.3.0/
+
+expected_downloads:
+  pyserini_source_reported_mb: 112.7
+  lucene_index_archive_bytes: 6895124480
+  corpus_shards: 20
+  corpus_compressed_bytes: 1575287888
+  note: Python dependency and extracted-index sizes vary; the disk gate uses 30 GiB.
