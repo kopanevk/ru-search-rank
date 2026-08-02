@@ -81,7 +81,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _load_retrieval_config(path: str | Path) -> dict[str, Any]:
-    config_path = Path(path)
+    config_path = Path(path).resolve()
     if not config_path.is_file():
         raise ValueError(f"retrieval config does not exist: {config_path}")
     try:
@@ -102,7 +102,28 @@ def _load_retrieval_config(path: str | Path) -> dict[str, Any]:
     missing = sorted(required.difference(payload))
     if missing:
         raise ValueError(f"retrieval config is missing sections: {', '.join(missing)}")
+    payload["_config_path"] = str(config_path)
     return payload
+
+
+def _repository_root(config: dict[str, Any]) -> Path:
+    config_path = Path(str(config["_config_path"]))
+    root_setting = Path(str(config.get("paths", {}).get("repository_root", ".")))
+    if root_setting.is_absolute():
+        return root_setting.resolve()
+    return (config_path.parent / root_setting).resolve()
+
+
+def _resolve_repository_path(config: dict[str, Any], value: str | Path) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (_repository_root(config) / path).resolve()
+
+
+def _portable_repository_path(config: dict[str, Any], path: Path) -> str:
+    try:
+        return path.resolve().relative_to(_repository_root(config)).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"path must stay inside the repository: {path}") from exc
 
 
 def _java_major_version(output: str) -> int | None:
@@ -176,9 +197,77 @@ def _annotation_paths(config: dict[str, Any]) -> dict[str, dict[str, Path]]:
     return download_annotation_files(
         topics_urls={str(key): str(value) for key, value in dataset["topics"].items()},
         qrels_urls={str(key): str(value) for key, value in dataset["qrels"].items()},
-        raw_dir=config["paths"]["raw_dir"],
+        raw_dir=_resolve_repository_path(config, config["paths"]["raw_dir"]),
         expected_rows={str(key): int(value) for key, value in dataset["expected_rows"].items()},
     )
+
+
+def _expected_annotation_paths(config: dict[str, Any]) -> dict[str, dict[str, Path]]:
+    raw_dir = _resolve_repository_path(config, config["paths"]["raw_dir"])
+    paths = {
+        split: {
+            "topics": raw_dir / f"topics.miracl-v1.0-ru-{split}.tsv",
+            "qrels": raw_dir / f"qrels.miracl-v1.0-ru-{split}.tsv",
+        }
+        for split in ("train", "dev")
+    }
+    paths["train"]["topics"] = _resolve_repository_path(
+        config, config["dataset"]["train_topics_path"]
+    )
+    return paths
+
+
+def _validate_train_topics(config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    path = _resolve_repository_path(config, config["dataset"]["train_topics_path"])
+    portable_path = _portable_repository_path(config, path)
+    download_hint = (
+        "Run `python -m rusearchrank.cli prepare-annotations "
+        "--config configs/retrieval.yaml` first to download official MIRACL topics."
+    )
+    if not path.exists():
+        raise ValueError(f"official train topics file is missing: {portable_path}. {download_hint}")
+    if not path.is_file():
+        raise ValueError(f"official train topics path is not a regular file: {portable_path}")
+    if path.suffix.lower() != ".tsv":
+        raise ValueError(f"official train topics file must have a .tsv suffix: {portable_path}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"official train topics TSV is empty: {portable_path}. {download_hint}")
+
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, raw_line in enumerate(stream, start=1):
+            line = raw_line.rstrip("\r\n")
+            if "\t" not in line:
+                raise ValueError(
+                    f"malformed train topics line {line_number}: expected query_id<TAB>query_text"
+                )
+            query_id, query_text = line.split("\t", 1)
+            if not query_id.strip():
+                raise ValueError(f"empty query_id in train topics at line {line_number}")
+            if not query_text.strip():
+                raise ValueError(f"empty query_text in train topics at line {line_number}")
+            if query_id in seen:
+                raise ValueError(f"duplicate query_id in train topics: {query_id}")
+            seen.add(query_id)
+            rows.append((query_id, query_text))
+
+    expected = int(config["dataset"]["expected_rows"]["train_queries"])
+    if len(rows) != expected:
+        raise ValueError(
+            f"official train topics contain {len(rows)} unique queries; expected {expected}"
+        )
+    queries = pd.DataFrame(rows, columns=["query_id", "query_text"], dtype="string")
+    queries.insert(0, "split", "train")
+    validate_queries(queries)
+    metadata = {
+        "path": portable_path,
+        "sha256": _sha256(path),
+        "query_count": len(rows),
+        "source": str(config["dataset"]["topics"]["train"]),
+        "revision": str(config["dataset"]["annotations_revision"]),
+    }
+    return queries, metadata
 
 
 def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
@@ -595,6 +684,33 @@ def _validate_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prepare_annotations(args: argparse.Namespace) -> int:
+    config = _load_retrieval_config(args.config)
+    downloaded = _annotation_paths(config)
+    configured_train = _expected_annotation_paths(config)["train"]["topics"]
+    if downloaded["train"]["topics"].resolve() != configured_train.resolve():
+        raise ValueError(
+            "dataset.train_topics_path must identify the official downloaded train TSV"
+        )
+    _, train_metadata = _validate_train_topics(config)
+    _print_json(
+        {
+            "status": "ok",
+            "train_topics": train_metadata,
+            "dev_topics": _portable_repository_path(
+                config, downloaded["dev"]["topics"]
+            ),
+            "train_qrels": _portable_repository_path(
+                config, downloaded["train"]["qrels"]
+            ),
+            "dev_qrels": _portable_repository_path(
+                config, downloaded["dev"]["qrels"]
+            ),
+        }
+    )
+    return 0
+
+
 def _inspect_linux_environment(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
     report = _phase1_environment(config)
@@ -615,45 +731,84 @@ def _inspect_linux_environment(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retrieval_topics_argument(config: dict[str, Any], split: str) -> str:
+    if split == "train":
+        _, metadata = _validate_train_topics(config)
+        return str(metadata["path"])
+    if split == "dev":
+        return str(config["reproduction_gate"]["official_topic"])
+    raise ValueError(f"unsupported retrieval split: {split}")
+
+
+def _build_bm25_command(
+    config: dict[str, Any],
+    *,
+    split: str,
+    target: Path,
+    topics_argument: str | None = None,
+) -> list[str]:
+    topics = topics_argument or _retrieval_topics_argument(config, split)
+    return [
+        sys.executable,
+        "-m",
+        "pyserini.search.lucene",
+        "--threads",
+        str(config["retrieval"]["threads"]),
+        "--batch-size",
+        str(config["retrieval"]["batch_size"]),
+        "--language",
+        str(config["dataset"]["language"]),
+        "--topics",
+        topics,
+        "--index",
+        str(config["retrieval"]["index_name"]),
+        "--output",
+        str(target),
+        "--bm25",
+        "--hits",
+        str(config["retrieval"]["retrieval_hits"][split]),
+    ]
+
+
 def _run_bm25(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
     environment = _require_external_environment(config)
     splits = list(config["splits"]) if args.split == "all" else [args.split]
     run_keys = {"train": "train_run", "dev": "dev_run"}
-    targets = [_artifact_path(config, run_keys[split]) for split in splits]
+    targets = [
+        _resolve_repository_path(config, config["artifacts"][run_keys[split]])
+        for split in splits
+    ]
     _ensure_writable_targets(targets, overwrite=args.overwrite)
-    annotation_paths = _annotation_paths(config)
+    annotation_paths = _expected_annotation_paths(config)
 
     results: dict[str, Any] = {}
     for split, target in zip(splits, targets, strict=True):
-        queries = load_topics(annotation_paths[split]["topics"], split=split)
+        train_topics_metadata: dict[str, Any] | None = None
+        if split == "train":
+            queries, train_topics_metadata = _validate_train_topics(config)
+            topics_argument = str(train_topics_metadata["path"])
+        else:
+            queries = load_topics(annotation_paths[split]["topics"], split=split)
+            expected_queries = int(config["dataset"]["expected_rows"]["dev_queries"])
+            if len(queries) != expected_queries:
+                raise ValueError(
+                    f"official dev topics contain {len(queries)} queries; "
+                    f"expected {expected_queries}"
+                )
+            topics_argument = _retrieval_topics_argument(config, split)
         retrieval_hits = int(config["retrieval"]["retrieval_hits"][split])
-        official_topic = f"miracl-v1.0-ru-{split}"
         temporary = target.with_suffix(target.suffix + ".tmp")
-        command = [
-            sys.executable,
-            "-m",
-            "pyserini.search.lucene",
-            "--threads",
-            str(config["retrieval"]["threads"]),
-            "--batch-size",
-            str(config["retrieval"]["batch_size"]),
-            "--language",
-            str(config["dataset"]["language"]),
-            "--topics",
-            official_topic,
-            "--index",
-            str(config["retrieval"]["index_name"]),
-            "--output",
-            str(temporary),
-            "--bm25",
-            "--hits",
-            str(retrieval_hits),
-        ]
+        command = _build_bm25_command(
+            config,
+            split=split,
+            target=temporary,
+            topics_argument=topics_argument,
+        )
         started = time.perf_counter()
         result = subprocess.run(
             command,
-            cwd=Path.cwd(),
+            cwd=_repository_root(config),
             env=os.environ.copy(),
             capture_output=True,
             text=True,
@@ -677,7 +832,9 @@ def _run_bm25(args: argparse.Namespace) -> int:
         validate_query_coverage(validated, queries)
         # Preserve Pyserini's raw output byte-for-byte for official evaluation.
         temporary.replace(target)
-        work_path = Path(config["paths"]["work_dir"]) / f"retrieval_{split}.json"
+        work_path = _resolve_repository_path(
+            config, config["paths"]["work_dir"]
+        ) / f"retrieval_{split}.json"
         _write_json(
             work_path,
             {
@@ -686,13 +843,14 @@ def _run_bm25(args: argparse.Namespace) -> int:
                 "queries": int(len(queries)),
                 "rows": int(len(raw_run)),
                 "hits_per_query": retrieval_hits,
-                "official_topic": official_topic,
+                "topics_argument": topics_argument,
+                "train_topics": train_topics_metadata,
                 "command": command,
-                "run": str(target),
+                "run": _portable_repository_path(config, target),
             },
         )
         results[split] = {
-            "run": str(target),
+            "run": _portable_repository_path(config, target),
             "queries": int(len(queries)),
             "rows": int(len(raw_run)),
             "hits_per_query": retrieval_hits,
@@ -829,7 +987,9 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
     _atomic_parquet(candidate_frames["dev"], dev_candidates_path)
     _atomic_parquet(queries, queries_path)
     _atomic_parquet(passages, passages_path)
-    work_path = Path(config["paths"]["work_dir"]) / "candidate_cache.json"
+    work_path = _resolve_repository_path(
+        config, config["paths"]["work_dir"]
+    ) / "candidate_cache.json"
     _write_json(
         work_path,
         {
@@ -1059,12 +1219,20 @@ def _package_phase1(args: argparse.Namespace) -> int:
     if missing:
         raise ValueError(f"phase1 package inputs are missing: {', '.join(missing)}")
 
-    work_dir = Path(config["paths"]["work_dir"])
+    work_dir = _resolve_repository_path(config, config["paths"]["work_dir"])
     timings: dict[str, Any] = {}
     for name in ("retrieval_train", "retrieval_dev", "candidate_cache"):
         path = work_dir / f"{name}.json"
         if path.is_file():
             timings[name] = _read_json(path)
+    _, current_train_topics = _validate_train_topics(config)
+    retrieval_train = timings.get("retrieval_train")
+    if not isinstance(retrieval_train, dict) or retrieval_train.get(
+        "train_topics"
+    ) != current_train_topics:
+        raise ValueError(
+            "train topics metadata does not match the source used by train retrieval"
+        )
     text_lengths = passages["text"].astype("string").str.len()
     runtime_environment = _phase1_environment(config)
     manifest = {
@@ -1075,6 +1243,7 @@ def _package_phase1(args: argparse.Namespace) -> int:
             "language": config["dataset"]["language"],
             "corpus_revision": config["dataset"]["corpus_revision"],
             "annotations_revision": config["dataset"]["annotations_revision"],
+            "train_topics": current_train_topics,
         },
         "retrieval": {
             "engine": config["retrieval"]["engine"],
@@ -1212,6 +1381,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", default=str(DEFAULT_AUDIT_DIR / "miracl_schema.json")
     )
     data_parser.set_defaults(func=_inspect_data)
+
+    annotations_parser = subparsers.add_parser(
+        "prepare-annotations",
+        help="download and validate revision-pinned MIRACL topics and qrels",
+    )
+    annotations_parser.add_argument(
+        "--config", default=str(DEFAULT_RETRIEVAL_CONFIG)
+    )
+    annotations_parser.set_defaults(func=_prepare_annotations)
 
     checkpoint_parser = subparsers.add_parser(
         "inspect-checkpoint", help="inspect tokenizer/config and optionally run model inference"
