@@ -405,6 +405,119 @@ def parse_trec_eval_per_query(output: str, metric: str) -> dict[str, float]:
     return values
 
 
+def classify_bm25_tie_break_audit(
+    *, docno_desc_max_abs_difference: float, docno_asc_max_abs_difference: float,
+    tolerance: float
+) -> dict[str, Any]:
+    """Describe what per-query metric vectors can and cannot infer about ties."""
+
+    if tolerance < 0 or not all(
+        math.isfinite(value)
+        for value in (
+            docno_desc_max_abs_difference,
+            docno_asc_max_abs_difference,
+            tolerance,
+        )
+    ):
+        raise ValueError("tie-break audit requires finite non-negative tolerance")
+    desc_match = docno_desc_max_abs_difference <= tolerance
+    asc_match = docno_asc_max_abs_difference <= tolerance
+    if asc_match and not desc_match:
+        conclusion = "docno_asc"
+        explanation = "Only docno ASC reproduces the trec_eval per-query vector."
+    elif desc_match and not asc_match:
+        conclusion = "docno_desc"
+        explanation = "Only docno DESC reproduces the trec_eval per-query vector."
+    elif asc_match and desc_match:
+        conclusion = "inconclusive_metric_equivalent"
+        explanation = (
+            "Both docno policies are metric-equivalent within tolerance; the "
+            "available metric cannot empirically identify trec_eval's actual "
+            "tie policy."
+        )
+    else:
+        conclusion = "no_policy_matches"
+        explanation = (
+            "Neither docno ASC nor docno DESC reproduces the trec_eval per-query "
+            "vector within tolerance."
+        )
+    return {
+        "empirical_method": "compare full per-query nDCG@10 vectors",
+        "docno_desc_max_abs_difference": float(
+            docno_desc_max_abs_difference
+        ),
+        "docno_asc_max_abs_difference": float(docno_asc_max_abs_difference),
+        "tolerance": float(tolerance),
+        "docno_desc_matches": desc_match,
+        "docno_asc_matches": asc_match,
+        "conclusion": conclusion,
+        "explanation": explanation,
+    }
+
+
+def raw_score_tie_statistics(scores: pd.DataFrame) -> dict[str, Any]:
+    """Count exact stored-float32 ties under the production ranking rule."""
+
+    _require_columns(scores, {"query_id", "docid", "score"}, "raw scores")
+    frame = scores[["query_id", "docid", "score"]].copy()
+    if frame.isna().any().any():
+        raise ValueError("raw scores contain nulls")
+    frame[["query_id", "docid"]] = frame[["query_id", "docid"]].astype(
+        "string"
+    )
+    if frame.duplicated(["query_id", "docid"], keep=False).any():
+        raise ValueError("raw scores contain duplicate candidate keys")
+    numeric = pd.to_numeric(frame["score"], errors="raise")
+    if not np.isfinite(numeric.to_numpy(dtype=np.float64)).all():
+        raise ValueError("raw scores contain NaN or infinite values")
+    stored = numeric.astype("float32")
+    if not np.array_equal(
+        numeric.to_numpy(dtype=np.float64), stored.to_numpy(dtype=np.float64)
+    ):
+        raise ValueError("raw scores are not exact stored float32 values")
+    frame["score"] = stored
+    ordered = frame.sort_values(
+        ["query_id", "score", "docid"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    ).copy()
+    ordered["rank"] = (
+        ordered.groupby("query_id", sort=False).cumcount().add(1).astype("int64")
+    )
+    tie_groups = 0
+    rows_in_ties = 0
+    queries_with_any: set[str] = set()
+    queries_with_top10: set[str] = set()
+    crossing_rank10 = 0
+    largest = 0
+    for (query_id, _), group in ordered.groupby(
+        ["query_id", "score"], sort=False, dropna=False
+    ):
+        size = int(len(group))
+        if size < 2:
+            continue
+        ranks = group["rank"].to_numpy(dtype=np.int64)
+        tie_groups += 1
+        rows_in_ties += size
+        largest = max(largest, size)
+        queries_with_any.add(str(query_id))
+        if int((ranks <= 10).sum()) >= 2:
+            queries_with_top10.add(str(query_id))
+        if int(ranks.min()) <= 10 < int(ranks.max()):
+            crossing_rank10 += 1
+    return {
+        "raw_score_tie_definition": (
+            "exact_float32_equality_within_query_id_on_stored_raw_logits"
+        ),
+        "raw_score_tie_groups": tie_groups,
+        "rows_in_raw_score_ties": rows_in_ties,
+        "queries_with_any_raw_score_tie": len(queries_with_any),
+        "queries_with_top10_raw_score_tie": len(queries_with_top10),
+        "ties_crossing_rank10_boundary": crossing_rank10,
+        "largest_raw_score_tie_group": largest,
+    }
+
+
 def assert_candidate_set_invariant(
     left: pd.DataFrame,
     right: pd.DataFrame,
@@ -576,6 +689,79 @@ def _oracle_ranking(candidates: pd.DataFrame) -> pd.DataFrame:
     return states[["query_id", "docid", "bm25_rank"]]
 
 
+def _oracle_stratum_memberships(
+    *,
+    candidates: pd.DataFrame,
+    baseline_per_query: Mapping[str, float],
+    oracle_per_query: Mapping[str, float],
+    absolute_tolerance: float = 1e-12,
+    relative_tolerance: float = 1e-9,
+) -> tuple[dict[str, set[str]], dict[str, Any]]:
+    if set(baseline_per_query) != set(oracle_per_query):
+        raise ValueError("oracle stratification query universes differ")
+    states = _candidate_states(candidates)
+    relevant_by_query = states.groupby("query_id", sort=False)["is_relevant"].any()
+    memberships: dict[str, set[str]] = {
+        "no_relevant_in_candidates": set(),
+        "already_at_oracle": set(),
+        "improvable": set(),
+    }
+    for query_id in sorted(baseline_per_query):
+        baseline = float(baseline_per_query[query_id])
+        oracle = float(oracle_per_query[query_id])
+        if not math.isfinite(baseline) or not math.isfinite(oracle):
+            raise ValueError(f"non-finite oracle stratum metric for {query_id!r}")
+        if not bool(relevant_by_query.get(query_id, False)):
+            label = "no_relevant_in_candidates"
+        elif math.isclose(
+            baseline,
+            oracle,
+            rel_tol=relative_tolerance,
+            abs_tol=absolute_tolerance,
+        ):
+            label = "already_at_oracle"
+        elif baseline < oracle:
+            label = "improvable"
+        else:
+            raise ValueError(
+                f"BM25 nDCG@10 exceeds candidate oracle for {query_id!r}: "
+                f"baseline={baseline}, oracle={oracle}"
+            )
+        memberships[label].add(str(query_id))
+    sets = list(memberships.values())
+    union = set().union(*sets)
+    pairwise_disjoint = all(
+        sets[left].isdisjoint(sets[right])
+        for left in range(len(sets))
+        for right in range(left + 1, len(sets))
+    )
+    expected = {str(query_id) for query_id in baseline_per_query}
+    exactly_once = pairwise_disjoint and union == expected
+    query_count_sum = sum(len(values) for values in sets)
+    if not exactly_once or query_count_sum != len(expected):
+        raise RuntimeError("oracle strata are not an exact query partition")
+    at_oracle = (
+        len(memberships["no_relevant_in_candidates"])
+        + len(memberships["already_at_oracle"])
+    )
+    invariants = {
+        "strata_pairwise_disjoint": pairwise_disjoint,
+        "strata_cover_all_queries": union == expected,
+        "each_query_in_exactly_one_stratum": exactly_once,
+        "stratum_query_count_sum": query_count_sum,
+        "query_count": len(expected),
+        "queries_at_oracle_under_bm25": at_oracle,
+        "queries_at_oracle_consistency": (
+            at_oracle
+            == len(memberships["no_relevant_in_candidates"])
+            + len(memberships["already_at_oracle"])
+        ),
+        "absolute_tolerance": absolute_tolerance,
+        "relative_tolerance": relative_tolerance,
+    }
+    return memberships, invariants
+
+
 def sparse_judgment_diagnostics(
     *,
     candidates: pd.DataFrame,
@@ -668,6 +854,7 @@ def sparse_judgment_diagnostics(
         for row in oracle_metrics["per_query"]
     }
     at_oracle = None
+    bm25_oracle_strata = None
     if bm25_ranking is not None:
         baseline = evaluate_bm25_metrics(
             _normalise_ranking(bm25_ranking),
@@ -680,14 +867,20 @@ def sparse_judgment_diagnostics(
             str(row["query_id"]): float(row["ndcg_at_10"])
             for row in baseline["per_query"]
         }
-        at_oracle = sum(
-            math.isclose(
-                baseline_by_query[query_id],
-                oracle_by_query[query_id],
-                abs_tol=1e-12,
-            )
-            for query_id in universe
+        memberships, oracle_invariants = _oracle_stratum_memberships(
+            candidates=candidates,
+            baseline_per_query=baseline_by_query,
+            oracle_per_query=oracle_by_query,
         )
+        at_oracle = int(oracle_invariants["queries_at_oracle_under_bm25"])
+        bm25_oracle_strata = {
+            label: {
+                "query_count": len(query_ids_for_label),
+                "query_ids": sorted(query_ids_for_label),
+            }
+            for label, query_ids_for_label in memberships.items()
+        }
+        bm25_oracle_strata["invariants"] = oracle_invariants
     subset_rows = [metric_by_query[query_id] for query_id in eligible]
     subset = {
         "query_count": len(eligible),
@@ -715,6 +908,7 @@ def sparse_judgment_diagnostics(
         "queries_at_oracle_under_bm25": (
             int(at_oracle) if at_oracle is not None else None
         ),
+        "bm25_oracle_strata": bm25_oracle_strata,
         "oracle_ndcg_at_10_over_candidates": float(
             oracle_metrics["aggregate"]["ndcg_at_10"]
         ),
@@ -733,35 +927,26 @@ def stratified_delta_summary(
     system_per_query: Mapping[str, float],
     oracle_per_query: Mapping[str, float],
 ) -> dict[str, Any]:
-    states = _candidate_states(candidates)
-    relevant_by_query = states.groupby("query_id", sort=False)["is_relevant"].any()
-    strata: dict[str, list[float]] = {
-        "no_relevant_in_candidates": [],
-        "already_at_oracle": [],
-        "improvable": [],
-    }
     if set(baseline_per_query) != set(system_per_query) or set(baseline_per_query) != set(
         oracle_per_query
     ):
         raise ValueError("stratification query universes differ")
-    for query_id in sorted(baseline_per_query):
-        if not bool(relevant_by_query.get(query_id, False)):
-            label = "no_relevant_in_candidates"
-        elif math.isclose(
-            float(baseline_per_query[query_id]),
-            float(oracle_per_query[query_id]),
-            abs_tol=1e-12,
-        ):
-            label = "already_at_oracle"
-        else:
-            label = "improvable"
-        strata[label].append(
-            float(system_per_query[query_id]) - float(baseline_per_query[query_id])
-        )
-    return {
-        label: {
-            "query_count": len(values),
-            "mean_delta": float(np.mean(values)) if values else 0.0,
+    memberships, invariants = _oracle_stratum_memberships(
+        candidates=candidates,
+        baseline_per_query=baseline_per_query,
+        oracle_per_query=oracle_per_query,
+    )
+    result: dict[str, Any] = {}
+    for label, query_ids in memberships.items():
+        deltas = [
+            float(system_per_query[query_id])
+            - float(baseline_per_query[query_id])
+            for query_id in sorted(query_ids)
+        ]
+        result[label] = {
+            "query_count": len(query_ids),
+            "query_ids": sorted(query_ids),
+            "mean_delta": float(np.mean(deltas)) if deltas else 0.0,
         }
-        for label, values in strata.items()
-    }
+    result["invariants"] = invariants
+    return result
