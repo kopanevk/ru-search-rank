@@ -45,6 +45,8 @@ DEFAULT_RERANK_CONFIG = Path("configs/rerank.yaml")
 MODEL_ID = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 MODEL_REVISION = "1427fd652930e4ba29e8149678df786c240d8825"
 MODEL_TAG = "mminilmv2l12"
+TREC_EVAL_SOURCE_REPOSITORY = "https://github.com/usnistgov/trec_eval.git"
+TREC_EVAL_OFFICIAL_SOURCE_COMMIT = "d95ca64e14a47d763ae349fb65e6d8cde4141dbd"
 SCORE_COLUMNS = (
     "query_id",
     "docid",
@@ -404,7 +406,12 @@ def validate_rerank_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "evaluation",
         {
             "trec_eval_executable",
-            "trec_eval_version",
+            "trec_eval_expected_release",
+            "trec_eval_expected_source_tag",
+            "trec_eval_expected_source_commit",
+            "trec_eval_expected_reported_version",
+            "trec_eval_known_version_string_mismatch",
+            "trec_eval_provenance_path",
             "ndcg_command",
             "recall_command",
             "per_query_command",
@@ -493,6 +500,7 @@ def validate_rerank_config(config: Mapping[str, Any]) -> dict[str, Any]:
         archive["path"],
         paths["work_dir"],
         *implementation["source_files"],
+        evaluation["trec_eval_provenance_path"],
     ]
     for raw in configured_values:
         # The diagnostic run path is a literal portable template.
@@ -508,6 +516,13 @@ def validate_rerank_config(config: Mapping[str, Any]) -> dict[str, Any]:
     for name, expected in expected_eval.items():
         if [str(value) for value in evaluation[name]] != expected:
             raise ValueError(f"evaluation.{name} changed from the fixed command")
+    source_commit = str(evaluation["trec_eval_expected_source_commit"])
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ValueError("evaluation.trec_eval_expected_source_commit must be a Git SHA")
+    if not str(evaluation["trec_eval_expected_source_tag"]).startswith("v"):
+        raise ValueError("evaluation.trec_eval_expected_source_tag must be a release tag")
+    if bool(evaluation["trec_eval_known_version_string_mismatch"]) is not True:
+        raise ValueError("the pinned trec_eval release requires the known mismatch flag")
     return {
         "repository_root": str(root),
         "config": portable_path(config, Path(str(config["_config_path"]))),
@@ -2173,7 +2188,9 @@ def parse_trec_eval_version(stdout: str, stderr: str = "") -> str | None:
     return None
 
 
-def probe_trec_eval(executable: Path, *, expected_version: str) -> dict[str, Any]:
+def probe_trec_eval(
+    executable: Path, *, expected_reported_version: str
+) -> dict[str, Any]:
     command = [str(executable), "-v"]
     result = subprocess.run(
         command,
@@ -2182,16 +2199,17 @@ def probe_trec_eval(executable: Path, *, expected_version: str) -> dict[str, Any
         check=False,
         timeout=30,
     )
-    parsed_version = parse_trec_eval_version(result.stdout, result.stderr)
+    reported_version = parse_trec_eval_version(result.stdout, result.stderr)
     return {
         "command": command,
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
-        "parsed_version": parsed_version,
-        "expected_version": str(expected_version),
-        "version_matches_expected": (
-            result.returncode == 0 and parsed_version == str(expected_version)
+        "binary_reported_version": reported_version,
+        "expected_reported_version": str(expected_reported_version),
+        "binary_reported_version_matches_expected": (
+            result.returncode == 0
+            and reported_version == str(expected_reported_version)
         ),
     }
 
@@ -2203,17 +2221,190 @@ def require_trec_eval_version(probe: Mapping[str, Any]) -> None:
             f"returncode={probe.get('returncode')}, stdout={probe.get('stdout')!r}, "
             f"stderr={probe.get('stderr')!r}"
         )
-    if probe.get("parsed_version") is None:
+    if probe.get("binary_reported_version") is None:
         raise ValueError(
             "trec_eval -v output did not contain a recognizable semantic version: "
             f"stdout={probe.get('stdout')!r}, stderr={probe.get('stderr')!r}"
         )
-    if probe.get("version_matches_expected") is not True:
+    if probe.get("binary_reported_version_matches_expected") is not True:
         raise ValueError(
-            "trec_eval version differs from the production protocol: "
-            f"parsed={probe.get('parsed_version')!r}, "
-            f"expected={probe.get('expected_version')!r}"
+            "trec_eval reported version differs from the production binary contract: "
+            f"reported={probe.get('binary_reported_version')!r}, "
+            f"expected_reported={probe.get('expected_reported_version')!r}"
         )
+
+
+def _git_output(source_path: Path, arguments: Sequence[str]) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(source_path), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            "trec_eval source checkout verification failed: "
+            f"git {' '.join(arguments)} returned {result.returncode}; "
+            f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+    return result.stdout.strip()
+
+
+def validate_trec_eval_build_provenance(
+    config: Mapping[str, Any], *, executable: Path | None = None
+) -> dict[str, Any]:
+    """Bind the evaluated binary to the pinned official source build."""
+
+    evaluation = config["evaluation"]
+    actual_executable = (executable or resolve_trec_eval(config)).resolve()
+    provenance_path = resolve_path(config, evaluation["trec_eval_provenance_path"])
+    provenance = _read_json(provenance_path)
+    required = {
+        "source_repository",
+        "source_tag",
+        "source_commit",
+        "source_tree_clean",
+        "fresh_checkout",
+        "makefile_sha256",
+        "binary_path",
+        "binary_sha256",
+        "binary_reported_version",
+        "expected_release_version",
+        "known_upstream_version_string_mismatch",
+        "build_command",
+        "compiler",
+        "built_at",
+    }
+    missing = sorted(required.difference(provenance))
+    if missing:
+        raise ValueError(
+            f"trec_eval build provenance is incomplete: missing {missing}"
+        )
+    expected = {
+        "source_repository": TREC_EVAL_SOURCE_REPOSITORY,
+        "source_tag": str(evaluation["trec_eval_expected_source_tag"]),
+        "source_commit": str(evaluation["trec_eval_expected_source_commit"]),
+        "source_tree_clean": True,
+        "fresh_checkout": True,
+        "binary_reported_version": str(
+            evaluation["trec_eval_expected_reported_version"]
+        ),
+        "expected_release_version": str(
+            evaluation["trec_eval_expected_release"]
+        ),
+        "known_upstream_version_string_mismatch": bool(
+            evaluation["trec_eval_known_version_string_mismatch"]
+        ),
+    }
+    mismatches = {
+        name: {"actual": provenance.get(name), "expected": value}
+        for name, value in expected.items()
+        if provenance.get(name) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "trec_eval release provenance differs from the evaluation contract: "
+            + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
+        )
+    recorded_binary = Path(str(provenance["binary_path"]))
+    if not recorded_binary.is_absolute() or recorded_binary.resolve() != actual_executable:
+        raise ValueError(
+            "trec_eval executable is not the binary recorded by build provenance: "
+            f"actual={actual_executable}, recorded={recorded_binary}"
+        )
+    recorded_hash = str(provenance["binary_sha256"])
+    if not re.fullmatch(r"[0-9a-f]{64}", recorded_hash):
+        raise ValueError("trec_eval provenance binary_sha256 is invalid")
+    actual_hash = sha256_file(actual_executable)
+    if actual_hash != recorded_hash:
+        raise ValueError(
+            "trec_eval executable SHA-256 differs from build provenance: "
+            f"actual={actual_hash}, recorded={recorded_hash}"
+        )
+    makefile_hash = str(provenance["makefile_sha256"])
+    if not re.fullmatch(r"[0-9a-f]{64}", makefile_hash):
+        raise ValueError("trec_eval provenance makefile_sha256 is invalid")
+    build_command = str(provenance["build_command"]).strip()
+    if re.fullmatch(r"make(?:\s+-j(?:\s*\d+)?)?", build_command) is None:
+        raise ValueError("trec_eval provenance build_command must be an unpatched make build")
+    if not str(provenance["compiler"]).strip():
+        raise ValueError("trec_eval provenance compiler must be non-empty")
+    built_at = str(provenance["built_at"])
+    try:
+        parsed_built_at = datetime.fromisoformat(built_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("trec_eval provenance built_at is not an ISO-8601 timestamp") from exc
+    if parsed_built_at.tzinfo is None or parsed_built_at.utcoffset() != timezone.utc.utcoffset(parsed_built_at):
+        raise ValueError("trec_eval provenance built_at must be UTC")
+
+    source_checkout_verified = False
+    source_path_value = provenance.get("source_path")
+    if source_path_value is not None:
+        source_path = Path(str(source_path_value)).resolve()
+        if not source_path.is_dir():
+            raise ValueError(f"trec_eval provenance source_path is unavailable: {source_path}")
+        actual_commit = _git_output(source_path, ["rev-parse", "HEAD"])
+        tags = set(_git_output(source_path, ["tag", "--points-at", "HEAD"]).splitlines())
+        actual_remote = _git_output(source_path, ["remote", "get-url", "origin"])
+        _git_output(source_path, ["diff", "--quiet", "HEAD"])
+        _git_output(source_path, ["diff", "--cached", "--quiet"])
+        if actual_commit != expected["source_commit"]:
+            raise ValueError(
+                f"trec_eval source checkout commit mismatch: {actual_commit}"
+            )
+        if expected["source_tag"] not in tags:
+            raise ValueError(
+                f"trec_eval source checkout is not at exact tag {expected['source_tag']}"
+            )
+        if actual_remote.rstrip("/") != TREC_EVAL_SOURCE_REPOSITORY.rstrip("/"):
+            raise ValueError(
+                f"trec_eval source checkout remote mismatch: {actual_remote}"
+            )
+        actual_makefile_hash = sha256_file(source_path / "Makefile")
+        if actual_makefile_hash != makefile_hash:
+            raise ValueError(
+                "trec_eval source Makefile SHA-256 differs from build provenance: "
+                f"actual={actual_makefile_hash}, recorded={makefile_hash}"
+            )
+        source_checkout_verified = True
+    elif expected["source_commit"] == TREC_EVAL_OFFICIAL_SOURCE_COMMIT:
+        raise ValueError(
+            "official trec_eval provenance must include source_path for independent "
+            "tag, commit, remote, and clean-tree verification"
+        )
+
+    version_probe = probe_trec_eval(
+        actual_executable,
+        expected_reported_version=str(
+            evaluation["trec_eval_expected_reported_version"]
+        ),
+    )
+    require_trec_eval_version(version_probe)
+    if provenance["binary_reported_version"] != version_probe["binary_reported_version"]:
+        raise ValueError("live trec_eval -v output differs from build provenance")
+    return {
+        "provenance_path": portable_path(config, provenance_path),
+        "source_repository": expected["source_repository"],
+        "source_tag": expected["source_tag"],
+        "source_commit": expected["source_commit"],
+        "source_tree_clean": True,
+        "fresh_checkout": True,
+        "source_checkout_verified": source_checkout_verified,
+        "makefile_sha256": makefile_hash,
+        "binary_path": str(actual_executable),
+        "binary_sha256": actual_hash,
+        "binary_reported_version": version_probe["binary_reported_version"],
+        "expected_release_version": expected["expected_release_version"],
+        "known_upstream_version_string_mismatch": True,
+        "release_provenance_matches_expected": True,
+        "binary_hash_matches_provenance": True,
+        "evaluation_protocol_status": "PASS",
+        "build_command": build_command,
+        "compiler": str(provenance["compiler"]),
+        "built_at": built_at,
+        "version_probe": version_probe,
+    }
 
 
 def resolve_model_revision(
@@ -2252,11 +2443,9 @@ def preflight_rerank(
     model = resolve_model_revision(config, api=model_api)
     memory = require_available_memory(config)
     executable = resolve_trec_eval(config)
-    expected_trec_version = str(config["evaluation"]["trec_eval_version"])
-    trec_probe = probe_trec_eval(
-        executable, expected_version=expected_trec_version
+    trec_provenance = validate_trec_eval_build_provenance(
+        config, executable=executable
     )
-    require_trec_eval_version(trec_probe)
     scoring_hash, scoring_details = scoring_source_sha256(config)
     evaluation_hash, source_files = evaluation_source_sha256(config)
     root = repository_root(config)
@@ -2276,8 +2465,7 @@ def preflight_rerank(
         "qrels_present": True,
         "trec_eval": {
             "path": str(executable),
-            "expected_version": expected_trec_version,
-            "probe": trec_probe,
+            **trec_provenance,
         },
         "memory": memory,
         "disk": {
@@ -2907,6 +3095,11 @@ def validate_phase2_manifest(
 ) -> None:
     if manifest.get("status") != "PASS":
         raise ValueError("rerank manifest status must be PASS")
+    trec_provenance = manifest.get("trec_eval_provenance")
+    if not isinstance(trec_provenance, Mapping) or trec_provenance.get(
+        "evaluation_protocol_status"
+    ) != "PASS":
+        raise ValueError("rerank manifest lacks passing trec_eval build provenance")
     files = manifest.get("files")
     if not isinstance(files, list):
         raise ValueError("rerank manifest files must be a list")
@@ -3062,6 +3255,42 @@ def package_phase2(
 ) -> dict[str, Any]:
     validate_rerank_config(config)
     validate_phase1_inputs(config)
+    metric_paths = {
+        name: resolve_path(config, config["metrics"][name])
+        for name in ("baseline", "system", "comparison", "depth_profile")
+    }
+    missing_metrics = [
+        portable_path(config, path)
+        for path in metric_paths.values()
+        if not path.is_file()
+    ]
+    if missing_metrics:
+        raise ValueError(
+            "Phase 2 evaluation outputs are incomplete.\n"
+            f"Missing: {', '.join(missing_metrics)}\n"
+            "Run evaluate-rerank successfully before package-phase2.\n"
+            "Existing *.stale.* files are backups and are not valid package inputs."
+        )
+    metric_reports = {name: _read_json(path) for name, path in metric_paths.items()}
+    fingerprints = {
+        str(report.get("evaluation_fingerprint", ""))
+        for report in metric_reports.values()
+    }
+    trec_provenances = [
+        report.get("trec_eval_provenance") for report in metric_reports.values()
+    ]
+    if (
+        any(report.get("status") != "PASS" for report in metric_reports.values())
+        or len(fingerprints) != 1
+        or not next(iter(fingerprints))
+        or not isinstance(trec_provenances[0], Mapping)
+        or any(value != trec_provenances[0] for value in trec_provenances[1:])
+        or trec_provenances[0].get("evaluation_protocol_status") != "PASS"
+    ):
+        raise ValueError(
+            "Phase 2 evaluation outputs are incompatible; run evaluate-rerank "
+            "successfully before package-phase2"
+        )
     base_payloads = phase2_payload_paths(config)[:-1]
     for path in base_payloads:
         _require_regular_file(path, "Phase 2 package input")
@@ -3073,9 +3302,7 @@ def package_phase2(
             score_path, columns=["query_id", "docid", "score"]
         ).to_pandas()
     )
-    system_metrics = _read_json(
-        resolve_path(config, config["metrics"]["system"])
-    )
+    system_metrics = metric_reports["system"]
     evaluation_commit = str(system_metrics.get("evaluation_commit", ""))
     if evaluation_commit != "UNAVAILABLE" and not re.fullmatch(
         r"[0-9a-f]{40}", evaluation_commit
@@ -3155,6 +3382,7 @@ def package_phase2(
     manifest = {
         "status": "PASS",
         "created_at": utc_now(),
+        "trec_eval_provenance": dict(trec_provenances[0]),
         "files": [
             _manifest_entry(
                 config,

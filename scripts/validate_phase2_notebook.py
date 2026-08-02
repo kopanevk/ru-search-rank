@@ -59,7 +59,26 @@ def main() -> int:
             "BRANCH = 'phase-2'",
             "ALLOW_OVERWRITE_PHASE2 = False",
         ],
-        4: ["openjdk-21-jdk-headless", "TREC_EVAL_TAG = 'v9.0.8'", "rev-list", "trec_eval', '-v'"],
+        4: [
+            "openjdk-21-jdk-headless",
+            "TREC_EVAL_TAG = 'v9.0.8'",
+            "TREC_EVAL_COMMIT = 'd95ca64e14a47d763ae349fb65e6d8cde4141dbd'",
+            "shutil.rmtree(TREC_EVAL_DIR)",
+            "'clone', '--depth', '1', '--branch', TREC_EVAL_TAG",
+            "rev-list",
+            "'diff', '--quiet', 'HEAD'",
+            "'diff', '--cached', '--quiet'",
+            "makefile_sha256_before",
+            "makefile_sha256_after",
+            "'/opt/bin/trec_eval', '-v'",
+            "9\\.0\\.7",
+            "binary_sha256",
+            "trec_eval_build_provenance.json",
+            "known_upstream_version_string_mismatch",
+            "'fresh_checkout': True",
+            "'makefile_sha256': makefile_sha256_after",
+            "shutil.which('trec_eval')",
+        ],
         5: ["3.12", "RUN_PYTHON", "pip_install_project"],
         6: [
             "'-m', 'pytest', '-q'",
@@ -90,6 +109,20 @@ def main() -> int:
     require(
         "trec_eval', '-h'" not in sources[3],
         "Cell 4 must probe the actual trec_eval version with -v, not -h help.",
+    )
+    require(
+        not re.search(r"(?:sed|patch).*Makefile|Makefile.*(?:sed|patch)", sources[3]),
+        "Cell 4 must not patch or rewrite the upstream Makefile.",
+    )
+    require(
+        "'fetch'" not in sources[3]
+        and "trec_eval_fetch" not in sources[3]
+        and "if not (TREC_EVAL_DIR / '.git').is_dir()" not in sources[3],
+        "Cell 4 must always discard the old checkout and perform a fresh clone.",
+    )
+    require(
+        "['git', 'checkout'" not in sources[3],
+        "Cell 4 fresh tag clone must not reuse or switch an existing checkout.",
     )
 
     code_source = "\n".join(sources[1:])
@@ -139,6 +172,20 @@ def main() -> int:
     require(
         config["protocol"]["diagnostic_depths"] == [10, 20, 50],
         "diagnostic depths changed",
+    )
+    evaluation = config["evaluation"]
+    require(
+        evaluation["trec_eval_executable"] == "/opt/bin/trec_eval",
+        "Phase 2 must use the provenance-bound /opt/bin/trec_eval",
+    )
+    require(
+        evaluation["trec_eval_expected_release"] == "9.0.8"
+        and evaluation["trec_eval_expected_source_tag"] == "v9.0.8"
+        and evaluation["trec_eval_expected_source_commit"]
+        == "d95ca64e14a47d763ae349fb65e6d8cde4141dbd"
+        and evaluation["trec_eval_expected_reported_version"] == "9.0.7"
+        and evaluation["trec_eval_known_version_string_mismatch"] is True,
+        "trec_eval release/source/reported-version contract changed",
     )
 
     # Production modules are inspected syntactically: comments and audit keys may

@@ -96,7 +96,7 @@ def _write_fake_trec_eval(path: Path) -> None:
 import math, sys
 args = sys.argv[1:]
 if '-v' in args:
-    print('trec_eval 9.0.8')
+    print('trec_eval version 9.0.7')
     raise SystemExit(0)
 metric = args[args.index('-m') + 1]
 per_query = '-q' in args
@@ -333,7 +333,14 @@ def build_fixture(tmp_path: Path) -> tuple[Path, dict[str, bytes]]:
         },
         "evaluation": {
             "trec_eval_executable": str(fake_trec),
-            "trec_eval_version": "9.0.8",
+            "trec_eval_expected_release": "9.0.8",
+            "trec_eval_expected_source_tag": "v9.0.8",
+            "trec_eval_expected_source_commit": "1" * 40,
+            "trec_eval_expected_reported_version": "9.0.7",
+            "trec_eval_known_version_string_mismatch": True,
+            "trec_eval_provenance_path": (
+                "artifacts/work/phase2/trec_eval_build_provenance.json"
+            ),
             "ndcg_command": ["-c", "-M", "100", "-m", "ndcg_cut.10"],
             "recall_command": ["-c", "-m", "recall.100"],
             "per_query_command": ["-c", "-M", "100", "-q", "-m", "ndcg_cut.10"],
@@ -352,6 +359,32 @@ def build_fixture(tmp_path: Path) -> tuple[Path, dict[str, bytes]]:
     config_path = tmp_path / "configs/rerank.yaml"
     config_path.write_text(
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    provenance_path = (
+        tmp_path / "artifacts/work/phase2/trec_eval_build_provenance.json"
+    )
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "source_repository": rerank.TREC_EVAL_SOURCE_REPOSITORY,
+                "source_tag": "v9.0.8",
+                "source_commit": "1" * 40,
+                "source_tree_clean": True,
+                "fresh_checkout": True,
+                "makefile_sha256": "3" * 64,
+                "binary_path": str(fake_trec.resolve()),
+                "binary_sha256": hashlib.sha256(fake_trec.read_bytes()).hexdigest(),
+                "binary_reported_version": "9.0.7",
+                "expected_release_version": "9.0.8",
+                "known_upstream_version_string_mismatch": True,
+                "build_command": "make -j2",
+                "compiler": "fixture cc 1.0",
+                "built_at": "2026-08-02T00:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
     loaded = rerank.load_rerank_config(config_path)
     smoke = {
@@ -377,6 +410,35 @@ def _score_args(config_path: Path, *, overwrite: bool = False) -> argparse.Names
         batch_size=None,
         overwrite=overwrite,
     )
+
+
+def _evaluation_args(
+    config_path: Path, *, overwrite: bool = False
+) -> argparse.Namespace:
+    return argparse.Namespace(config=str(config_path), split="dev", overwrite=overwrite)
+
+
+def _prepare_fixture_evaluation(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object], dict[str, Path], dict[str, bytes]]:
+    config_path, _ = build_fixture(tmp_path)
+    config = rerank.load_rerank_config(config_path)
+    rerank.run_rerank_scoring(
+        config, split="dev", requested_device="cpu", scorer=StubScorer()
+    )
+    for depth in (100, 10, 20, 50):
+        rerank.build_rerank_run(config, split="dev", depth=depth)
+    assert cli_module._evaluate_rerank(_evaluation_args(config_path)) == 0
+    metric_paths = {
+        name: rerank.resolve_path(config, config["metrics"][name])
+        for name in ("baseline", "system", "comparison", "depth_profile")
+    }
+    protected_paths = [
+        rerank.resolve_path(config, config["artifacts"]["scores"]),
+        *(rerank.rerank_run_path(config, depth) for depth in (10, 20, 50, 100)),
+    ]
+    protected_bytes = {str(path): path.read_bytes() for path in protected_paths}
+    return config_path, config, metric_paths, protected_bytes
 
 
 def test_full_fixture_pipeline_resume_evaluation_package_and_idempotence(
@@ -458,8 +520,11 @@ def test_full_fixture_pipeline_resume_evaluation_package_and_idempotence(
         assert field in system_metrics
     version_probe = system_metrics["trec_eval"]["version_probe"]
     assert version_probe["command"][-1] == "-v"
-    assert version_probe["parsed_version"] == "9.0.8"
-    assert version_probe["version_matches_expected"] is True
+    assert version_probe["binary_reported_version"] == "9.0.7"
+    assert version_probe["binary_reported_version_matches_expected"] is True
+    assert system_metrics["trec_eval_provenance"][
+        "expected_release_version"
+    ] == "9.0.8"
     baseline_metrics = json.loads(
         (tmp_path / "reports/metrics/dev_bm25_baseline.json").read_text()
     )
@@ -526,6 +591,167 @@ def test_full_fixture_pipeline_resume_evaluation_package_and_idempotence(
     assert main(["package-phase2", "--config", str(config_path)]) == 0
     assert all(path.read_bytes() == before[str(path)] for path in outputs)
     assert all(Path(path).read_bytes() == content for path, content in phase1_before.items())
+
+
+def test_trec_eval_provenance_preflight_failure_preserves_metrics(
+    tmp_path: Path,
+) -> None:
+    config_path, config, metric_paths, protected = _prepare_fixture_evaluation(tmp_path)
+    before = {name: path.read_bytes() for name, path in metric_paths.items()}
+    provenance_path = rerank.resolve_path(
+        config, config["evaluation"]["trec_eval_provenance_path"]
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["source_commit"] = "2" * 40
+    provenance_path.write_text(json.dumps(provenance) + "\n", encoding="utf-8")
+    with pytest.raises(cli_module.StageError, match="evaluate-rerank/preflight"):
+        cli_module._evaluate_rerank(_evaluation_args(config_path, overwrite=True))
+    assert all(path.read_bytes() == before[name] for name, path in metric_paths.items())
+    assert not list((tmp_path / "reports/metrics").glob("*.stale.*"))
+    assert all(Path(path).read_bytes() == value for path, value in protected.items())
+
+
+def test_qrels_preflight_failure_preserves_metrics(tmp_path: Path) -> None:
+    config_path, config, metric_paths, protected = _prepare_fixture_evaluation(tmp_path)
+    before = {name: path.read_bytes() for name, path in metric_paths.items()}
+    qrels_path = rerank.resolve_path(config, config["inputs"]["qrels"])
+    qrels_path.write_text(qrels_path.read_text() + "broken\n", encoding="utf-8")
+    with pytest.raises(cli_module.StageError, match="evaluate-rerank/preflight"):
+        cli_module._evaluate_rerank(_evaluation_args(config_path, overwrite=True))
+    assert all(path.read_bytes() == before[name] for name, path in metric_paths.items())
+    assert all(Path(path).read_bytes() == value for path, value in protected.items())
+
+
+@pytest.mark.parametrize("failed_report", [2, 3, 4])
+def test_temporary_report_failure_preserves_production_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_report: int,
+) -> None:
+    config_path, _, metric_paths, protected = _prepare_fixture_evaluation(tmp_path)
+    before = {name: path.read_bytes() for name, path in metric_paths.items()}
+    original_write = cli_module._write_json
+    calls = 0
+
+    def failing_write(path: Path, payload: dict[str, object]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failed_report:
+            raise RuntimeError(f"fixture report {failed_report} failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(cli_module, "_write_json", failing_write)
+    with pytest.raises(
+        cli_module.StageError, match="temporary-calculation-validation"
+    ):
+        cli_module._evaluate_rerank(_evaluation_args(config_path, overwrite=True))
+    assert all(path.read_bytes() == before[name] for name, path in metric_paths.items())
+    assert all(Path(path).read_bytes() == value for path, value in protected.items())
+
+
+def test_publication_failure_rolls_back_complete_metrics_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, _, metric_paths, protected = _prepare_fixture_evaluation(tmp_path)
+    before = {name: path.read_bytes() for name, path in metric_paths.items()}
+    real_replace = os.replace
+    published = 0
+    failed = False
+
+    def failing_replace(source: object, destination: object) -> None:
+        nonlocal published, failed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.name in {"baseline.json", "system.json", "comparison.json", "depth_profile.json"}:
+            published += 1
+            if published == 2 and not failed:
+                failed = True
+                raise OSError("fixture failure after first published report")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(cli_module.os, "replace", failing_replace)
+    with pytest.raises(cli_module.StageError, match='"rollback_status": "PASS"'):
+        cli_module._evaluate_rerank(_evaluation_args(config_path, overwrite=True))
+    assert all(path.read_bytes() == before[name] for name, path in metric_paths.items())
+    assert all(Path(path).read_bytes() == value for path, value in protected.items())
+
+
+def test_successful_overwrite_publishes_one_consistent_generation(
+    tmp_path: Path,
+) -> None:
+    config_path, config, metric_paths, _ = _prepare_fixture_evaluation(tmp_path)
+    before = {name: path.read_bytes() for name, path in metric_paths.items()}
+    assert cli_module._evaluate_rerank(
+        _evaluation_args(config_path, overwrite=True)
+    ) == 0
+    reports = {
+        name: json.loads(path.read_text(encoding="utf-8"))
+        for name, path in metric_paths.items()
+    }
+    assert len({report["evaluation_fingerprint"] for report in reports.values()}) == 1
+    assert len({json.dumps(report["trec_eval_provenance"], sort_keys=True) for report in reports.values()}) == 1
+    assert any(path.read_bytes() != before[name] for name, path in metric_paths.items())
+    backup_dirs = list(
+        rerank.resolve_path(config, config["paths"]["work_dir"]).glob("metrics-backup-*")
+    )
+    assert len(backup_dirs) == 1
+    assert {
+        path.name: path.read_bytes() for path in backup_dirs[0].glob("*.json")
+    } == {
+        metric_paths[name].name: value for name, value in before.items()
+    }
+
+
+def test_evaluation_recreates_missing_active_metrics_without_using_stale_backups(
+    tmp_path: Path,
+) -> None:
+    config_path, _, metric_paths, protected = _prepare_fixture_evaluation(tmp_path)
+    stale_paths: dict[str, Path] = {}
+    for name, active in metric_paths.items():
+        stale = active.with_name(f"{active.name}.stale.fixture")
+        active.replace(stale)
+        stale.write_bytes(f"invalid stale backup for {name}\n".encode())
+        stale_paths[name] = stale
+    assert not any(path.exists() for path in metric_paths.values())
+
+    assert cli_module._evaluate_rerank(
+        _evaluation_args(config_path, overwrite=True)
+    ) == 0
+
+    reports = {
+        name: json.loads(path.read_text(encoding="utf-8"))
+        for name, path in metric_paths.items()
+    }
+    assert all(report["status"] == "PASS" for report in reports.values())
+    assert len({report["evaluation_fingerprint"] for report in reports.values()}) == 1
+    assert all(
+        path.read_bytes() == f"invalid stale backup for {name}\n".encode()
+        for name, path in stale_paths.items()
+    )
+    assert all(Path(path).read_bytes() == value for path, value in protected.items())
+
+
+@pytest.mark.parametrize("as_stale", [False, True])
+def test_package_rejects_incomplete_metrics_without_touching_outputs(
+    tmp_path: Path, as_stale: bool
+) -> None:
+    _, config, metric_paths, _ = _prepare_fixture_evaluation(tmp_path)
+    missing = metric_paths["baseline"]
+    if as_stale:
+        missing.replace(missing.with_name(f"{missing.name}.stale.fixture"))
+    else:
+        missing.unlink()
+    manifest = rerank.resolve_path(config, config["audits"]["manifest"])
+    archive = rerank.resolve_path(config, config["archive"]["path"])
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_bytes(b"old-manifest")
+    archive.write_bytes(b"old-zip")
+    with pytest.raises(ValueError, match="evaluation outputs are incomplete") as error:
+        rerank.package_phase2(config, overwrite=True)
+    assert "*.stale.* files are backups" in str(error.value)
+    assert manifest.read_bytes() == b"old-manifest"
+    assert archive.read_bytes() == b"old-zip"
 
 
 @pytest.mark.parametrize("damage", ["version", "byte", "row", "null"])
