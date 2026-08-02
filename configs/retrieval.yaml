@@ -67,6 +67,9 @@ audits:
   manifest: reports/audit/candidate_cache_manifest.json
 
 reproduction_gate:
+  trec_eval_executable: trec_eval
+  trec_eval_version: "9.0.8"
+  trec_eval_source: https://github.com/usnistgov/trec_eval/tree/v9.0.8
   official_topic: miracl-v1.0-ru-dev
   official_ndcg_at_10: 0.334
   official_recall_at_100: 0.661
@@ -77,11 +80,13 @@ reproduction_gate:
     --language ru --topics miracl-v1.0-ru-dev --index miracl-v1.0-ru
     --output run.miracl.bm25.ru.dev.txt --bm25 --hits 1000
   official_ndcg_command: >-
-    python -m pyserini.eval.trec_eval -c -M 100 -m ndcg_cut.10
-    miracl-v1.0-ru-dev run.miracl.bm25.ru.dev.txt
+    trec_eval -c -M 100 -m ndcg_cut.10
+    artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv
+    artifacts/runs/dev_bm25_top1000.trec
   official_recall_command: >-
-    python -m pyserini.eval.trec_eval -c -m recall.100
-    miracl-v1.0-ru-dev run.miracl.bm25.ru.dev.txt
+    trec_eval -c -m recall.100
+    artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv
+    artifacts/runs/dev_bm25_top1000.trec
 
 archive:
   path: artifacts/rusearchrank_phase1_results.zip

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
+import subprocess
 
 import pandas as pd
 import pytest
 
+import rusearchrank.cli as cli_module
 from rusearchrank.evaluation import (
     evaluate_bm25_metrics,
     parse_trec_eval_metric,
@@ -76,11 +79,76 @@ def test_condensed_uses_the_full_candidate_list_before_cutoff() -> None:
     assert metrics["condensed_ndcg_at_10"] == 1.0
 
 
-def test_parse_official_trec_eval_output() -> None:
+def test_parse_tab_separated_trec_eval_output() -> None:
     output = "ndcg_cut_10\tall\t0.3340\n"
     assert parse_trec_eval_metric(output, "ndcg_cut_10") == 0.334
+
+
+def test_parse_space_separated_trec_eval_output() -> None:
+    output = "recall_100    all    0.6610\n"
+    assert parse_trec_eval_metric(output, "recall_100") == 0.661
+
+
+def test_parse_trec_eval_ignores_warning_and_blank_lines() -> None:
+    output = "\nwarning: ignored diagnostic text\nndcg_cut_10 all 0.3342\n"
+    assert parse_trec_eval_metric(output, "ndcg_cut_10") == 0.3342
+
+
+def test_parse_trec_eval_rejects_missing_metric() -> None:
     with pytest.raises(ValueError, match="expected one"):
+        parse_trec_eval_metric("map all 0.2\n", "ndcg_cut_10")
+
+
+def test_parse_trec_eval_rejects_empty_output() -> None:
+    with pytest.raises(ValueError, match="ndcg_cut_10"):
         parse_trec_eval_metric("", "ndcg_cut_10")
+
+
+def test_direct_trec_eval_nonzero_return_code_is_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: object, **kwargs: object) -> object:
+        assert kwargs["check"] is True
+        raise subprocess.CalledProcessError(
+            2,
+            args[0],
+            output="partial stdout",
+            stderr="fatal stderr",
+        )
+
+    monkeypatch.setattr(cli_module.subprocess, "run", fail)
+    with pytest.raises(RuntimeError, match="exit code 2"):
+        cli_module._run_trec_eval_binary(
+            Path("/usr/local/bin/trec_eval"), ["-m", "recall.100", "qrels", "run"]
+        )
+
+
+def test_direct_trec_eval_preserves_stdout_stderr_and_uses_check_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def succeed(command: list[str], **kwargs: object) -> object:
+        assert kwargs["check"] is True
+        return type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": "recall_100 all 0.661\n", "stderr": "note\n"},
+        )()
+
+    monkeypatch.setattr(cli_module.subprocess, "run", succeed)
+    result = cli_module._run_trec_eval_binary(
+        Path("/usr/local/bin/trec_eval"), ["-m", "recall.100", "qrels", "run"]
+    )
+    assert result["stdout"] == "recall_100 all 0.661\n"
+    assert result["stderr"] == "note\n"
+
+
+def test_both_official_metrics_pass_reproduction_gate() -> None:
+    rows = reproduction_rows(
+        official={"ndcg_at_10": 0.334, "recall_at_100": 0.661},
+        local={"ndcg_at_10": 0.3342, "recall_at_100": 0.661},
+        tolerances={"ndcg_at_10": 0.002, "recall_at_100": 0.005},
+    )
+    assert all(row["status"] == "PASS" for row in rows)
 
 
 def test_reproduction_rows_apply_absolute_tolerance() -> None:

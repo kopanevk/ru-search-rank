@@ -32,13 +32,13 @@ python -m pyserini.search.lucene \
 Official evaluation commands:
 
 ```bash
-python -m pyserini.eval.trec_eval \
-  -c -M 100 -m ndcg_cut.10 miracl-v1.0-ru-dev \
-  run.miracl.bm25.ru.dev.txt
+trec_eval -c -M 100 -m ndcg_cut.10 \
+  artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv \
+  artifacts/runs/dev_bm25_top1000.trec
 
-python -m pyserini.eval.trec_eval \
-  -c -m recall.100 miracl-v1.0-ru-dev \
-  run.miracl.bm25.ru.dev.txt
+trec_eval -c -m recall.100 \
+  artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv \
+  artifacts/runs/dev_bm25_top1000.trec
 ```
 
 The project runner retrieves train top-100 and runs the official dev command

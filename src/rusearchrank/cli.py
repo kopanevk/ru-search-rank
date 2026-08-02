@@ -1088,18 +1088,79 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_trec_eval(arguments: list[str]) -> str:
-    result = subprocess.run(
-        [sys.executable, "-m", "pyserini.eval.trec_eval", *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=1800,
+def _resolve_trec_eval_executable(config: dict[str, Any]) -> Path:
+    configured = str(
+        config["reproduction_gate"].get("trec_eval_executable", "trec_eval")
     )
-    if result.returncode != 0:
-        output = "\n".join(part for part in (result.stdout, result.stderr) if part)
-        raise RuntimeError(f"official Pyserini evaluation failed: {output.strip()}")
-    return result.stdout
+    if Path(configured).is_absolute() or "/" in configured:
+        candidate = _resolve_repository_path(config, configured)
+    else:
+        located = shutil.which(configured)
+        if located is None:
+            raise ValueError(
+                "official trec_eval binary was not found on PATH; install NIST "
+                "trec_eval or set reproduction_gate.trec_eval_executable"
+            )
+        candidate = Path(located).resolve()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise ValueError(f"trec_eval executable is not an executable file: {candidate}")
+    return candidate
+
+
+def _require_nonempty_regular_file(path: Path, *, label: str) -> None:
+    if not path.exists():
+        raise ValueError(f"{label} does not exist: {path}")
+    if not path.is_file():
+        raise ValueError(f"{label} is not a regular file: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"{label} is empty: {path}")
+
+
+def _run_trec_eval_binary(executable: Path, arguments: list[str]) -> dict[str, Any]:
+    command = [str(executable), *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=1800,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "official trec_eval command failed "
+            f"with exit code {exc.returncode}: {' '.join(command)}\n"
+            f"stdout:\n{exc.stdout or ''}\nstderr:\n{exc.stderr or ''}"
+        ) from exc
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _probe_trec_eval(executable: Path) -> dict[str, Any]:
+    command = [str(executable), "-h"]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"trec_eval -h failed with exit code {exc.returncode}: "
+            f"{exc.stderr or exc.stdout or ''}"
+        ) from exc
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 
 def _evaluate_bm25(args: argparse.Namespace) -> int:
@@ -1107,22 +1168,51 @@ def _evaluate_bm25(args: argparse.Namespace) -> int:
     environment = _require_external_environment(config)
     output = _audit_path(config, "reproduction")
     _ensure_writable_targets([output], overwrite=args.overwrite)
-    topic = str(config["reproduction_gate"]["official_topic"])
-    dev_run_path = _artifact_path(config, "dev_run")
-    if not dev_run_path.is_file():
-        raise ValueError(f"official dev top-1000 run does not exist: {dev_run_path}")
-    run_path = str(dev_run_path)
+    dev_run_path = _resolve_repository_path(config, config["artifacts"]["dev_run"])
+    dev_qrels_path = _expected_annotation_paths(config)["dev"]["qrels"]
+    _require_nonempty_regular_file(dev_qrels_path, label="official dev qrels")
+    _require_nonempty_regular_file(
+        dev_run_path, label="untouched official dev top-1000 run"
+    )
+    executable = _resolve_trec_eval_executable(config)
+    version_probe = _probe_trec_eval(executable)
     source_run_sha256 = _sha256(dev_run_path)
     source_run_size_bytes = dev_run_path.stat().st_size
 
     # The official tool evaluates the untouched 1,000-hit dev run first.
-    ndcg_stdout = _run_trec_eval(
-        ["-c", "-M", "100", "-m", "ndcg_cut.10", topic, run_path]
+    ndcg_execution = _run_trec_eval_binary(
+        executable,
+        [
+            "-c",
+            "-M",
+            "100",
+            "-m",
+            "ndcg_cut.10",
+            str(dev_qrels_path),
+            str(dev_run_path),
+        ],
     )
-    recall_stdout = _run_trec_eval(["-c", "-m", "recall.100", topic, run_path])
+    recall_execution = _run_trec_eval_binary(
+        executable,
+        [
+            "-c",
+            "-m",
+            "recall.100",
+            str(dev_qrels_path),
+            str(dev_run_path),
+        ],
+    )
+    parsed_metrics = {
+        "ndcg_cut_10": parse_trec_eval_metric(
+            str(ndcg_execution["stdout"]), "ndcg_cut_10"
+        ),
+        "recall_100": parse_trec_eval_metric(
+            str(recall_execution["stdout"]), "recall_100"
+        ),
+    }
     official_tool = {
-        "ndcg_at_10": parse_trec_eval_metric(ndcg_stdout, "ndcg_cut_10"),
-        "recall_at_100": parse_trec_eval_metric(recall_stdout, "recall_100"),
+        "ndcg_at_10": parsed_metrics["ndcg_cut_10"],
+        "recall_at_100": parsed_metrics["recall_100"],
     }
     if (
         _sha256(dev_run_path) != source_run_sha256
@@ -1146,14 +1236,46 @@ def _evaluate_bm25(args: argparse.Namespace) -> int:
     }
     rows = reproduction_rows(official=published, local=official_tool, tolerances=tolerances)
     gate_passed = all(row["status"] == "PASS" for row in rows)
+    expected_metrics = {
+        "ndcg_cut_10": published["ndcg_at_10"],
+        "recall_100": published["recall_at_100"],
+    }
+    metric_tolerances = {
+        "ndcg_cut_10": tolerances["ndcg_at_10"],
+        "recall_100": tolerances["recall_at_100"],
+    }
+    per_metric = [
+        {
+            "metric": metric,
+            "actual": parsed_metrics[metric],
+            "expected": expected_metrics[metric],
+            "tolerance": metric_tolerances[metric],
+            "absolute_difference": abs(
+                parsed_metrics[metric] - expected_metrics[metric]
+            ),
+            "pass": abs(parsed_metrics[metric] - expected_metrics[metric])
+            <= metric_tolerances[metric],
+        }
+        for metric in ("ndcg_cut_10", "recall_100")
+    ]
     payload = {
         "status": "PASS" if gate_passed else "FAIL",
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "official_source": config["sources"]["pyserini_miracl_2cr"],
         "official_commands": {
             "retrieval": config["reproduction_gate"]["official_retrieval_command"],
-            "ndcg": config["reproduction_gate"]["official_ndcg_command"],
-            "recall": config["reproduction_gate"]["official_recall_command"],
+            "ndcg": ndcg_execution["command"],
+            "recall": recall_execution["command"],
+        },
+        "trec_eval": {
+            "executable_path": str(executable),
+            "version": str(config["reproduction_gate"]["trec_eval_version"]),
+            "source": str(config["reproduction_gate"]["trec_eval_source"]),
+            "version_probe": version_probe,
+            "executions": {
+                "ndcg_cut_10": ndcg_execution,
+                "recall_100": recall_execution,
+            },
         },
         "environment": {
             "python": environment["python"],
@@ -1161,7 +1283,17 @@ def _evaluate_bm25(args: argparse.Namespace) -> int:
             "pyserini": environment["pyserini"],
         },
         "metrics": rows,
-        "source_run": str(dev_run_path),
+        "parsed_metrics": parsed_metrics,
+        "expected_values": expected_metrics,
+        "tolerances": metric_tolerances,
+        "per_metric": per_metric,
+        "overall_pass": gate_passed,
+        "qrels": {
+            "path": _portable_repository_path(config, dev_qrels_path),
+            "size_bytes": dev_qrels_path.stat().st_size,
+            "sha256": _sha256(dev_qrels_path),
+        },
+        "source_run": _portable_repository_path(config, dev_run_path),
         "source_run_sha256": source_run_sha256,
         "source_run_size_bytes": source_run_size_bytes,
         "source_run_hits_per_query": int(
