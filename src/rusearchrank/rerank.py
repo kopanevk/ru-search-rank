@@ -2841,6 +2841,9 @@ def _manifest_entry(
     *,
     score_sidecar: Mapping[str, Any],
     raw_score_ties: Mapping[str, Any],
+    evaluation_commit: str,
+    package_commit: str,
+    package_git_dirty: bool,
     producer_command: str,
     input_hashes: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -2882,6 +2885,10 @@ def _manifest_entry(
         "source_tree_sha256": str(score_sidecar["evaluation_source_sha256"]),
         "git_commit": str(components["git_commit"]),
         "git_dirty": bool(components["git_dirty"]),
+        "score_producer_commit": str(components["git_commit"]),
+        "evaluation_commit": evaluation_commit,
+        "package_commit": package_commit,
+        "package_git_dirty": package_git_dirty,
         "producer_config_sha256": str(components["config_sha256"]),
         "config_sha256": sha256_file(Path(str(config["_config_path"]))),
         "input_fingerprint": str(score_sidecar["input_fingerprint"]),
@@ -2943,6 +2950,10 @@ def validate_phase2_manifest(
         "source_tree_sha256",
         "git_commit",
         "git_dirty",
+        "score_producer_commit",
+        "evaluation_commit",
+        "package_commit",
+        "package_git_dirty",
         "config_sha256",
         "producer_config_sha256",
         "input_fingerprint",
@@ -3062,6 +3073,18 @@ def package_phase2(
             score_path, columns=["query_id", "docid", "score"]
         ).to_pandas()
     )
+    system_metrics = _read_json(
+        resolve_path(config, config["metrics"]["system"])
+    )
+    evaluation_commit = str(system_metrics.get("evaluation_commit", ""))
+    if evaluation_commit != "UNAVAILABLE" and not re.fullmatch(
+        r"[0-9a-f]{40}", evaluation_commit
+    ):
+        raise ValueError(
+            "system metrics do not contain a valid evaluation_commit; "
+            "rerun evaluate-rerank before package-phase2"
+        )
+    package_commit, package_git_dirty = git_provenance(repository_root(config))
     protocol_path = resolve_path(config, config["audits"]["protocol_snapshot"])
     manifest_path = resolve_path(config, config["audits"]["manifest"])
     archive_path = resolve_path(config, config["archive"]["path"])
@@ -3138,6 +3161,9 @@ def package_phase2(
                 path,
                 score_sidecar=score_sidecar,
                 raw_score_ties=raw_score_ties,
+                evaluation_commit=evaluation_commit,
+                package_commit=package_commit,
+                package_git_dirty=package_git_dirty,
                 producer_command=producers[portable_path(config, path)],
                 input_hashes=input_hashes[portable_path(config, path)],
             )

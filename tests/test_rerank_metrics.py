@@ -179,6 +179,46 @@ def test_oracle_below_one_can_still_be_already_at_oracle() -> None:
     assert strata["improvable"]["query_count"] == 0
 
 
+def test_oracle_partition_uses_full_precision_python_values_not_trec_text() -> None:
+    candidates = pd.DataFrame(
+        [
+            ("q", "candidate-relevant", 1, 1, "relevant"),
+            ("q", "candidate-nonrelevant", 2, 0, "judged_non_relevant"),
+        ],
+        columns=["query_id", "docid", "bm25_rank", "relevance_grade", "judgment"],
+    )
+    qrels = pd.DataFrame(
+        [
+            ("q", "candidate-relevant", 1),
+            ("q", "relevant-outside-candidates", 1),
+            ("q", "candidate-nonrelevant", 0),
+        ],
+        columns=["query_id", "docid", "relevance_grade"],
+    )
+    ranking = candidates[["query_id", "docid", "bm25_rank"]].copy()
+    baseline = evaluate_bm25_metrics(
+        ranking, qrels, query_ids=["q"]
+    )["per_query"][0]["ndcg_at_10"]
+    diagnostics = sparse_judgment_diagnostics(
+        candidates=candidates,
+        qrels=qrels,
+        ranking=ranking,
+        bm25_ranking=ranking,
+        query_ids=["q"],
+    )
+    oracle = diagnostics["oracle_per_query"]["q"]
+    rounded_trec_text = float(f"{baseline:.4f}")
+    assert baseline == oracle
+    assert rounded_trec_text != oracle
+    strata = stratified_delta_summary(
+        candidates=candidates,
+        baseline_per_query={"q": baseline},
+        system_per_query={"q": baseline},
+        oracle_per_query={"q": oracle},
+    )
+    assert strata["already_at_oracle"]["query_ids"] == ["q"]
+
+
 def test_unjudged_is_never_added_to_ideal_dcg() -> None:
     candidates, qrels, ranking = fixture()
     q1 = evaluate_bm25_metrics(

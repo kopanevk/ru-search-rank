@@ -480,6 +480,9 @@ def test_full_fixture_pipeline_resume_evaluation_package_and_idempotence(
         entry["scoring_source_sha256"]
         and entry["evaluation_source_sha256"]
         and "raw_score_tie_definition" in entry
+        and "score_producer_commit" in entry
+        and "evaluation_commit" in entry
+        and "package_commit" in entry
         for entry in manifest["files"]
     )
     protocol = tmp_path / "reports/audit/rerank_protocol.yaml"

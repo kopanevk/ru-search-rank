@@ -3255,6 +3255,12 @@ def _metric_common_provenance(
     score_ties: dict[str, Any],
     ranking_score_tie_rows: int,
 ) -> dict[str, Any]:
+    components = score_sidecar.get("fingerprint_components")
+    if not isinstance(components, dict):
+        raise ValueError("score sidecar is missing fingerprint components")
+    evaluation_commit, evaluation_git_dirty = rerank_module.git_provenance(
+        rerank_module.repository_root(config)
+    )
     return {
         "input_artifacts": input_artifacts,
         "model_id": str(config["model"]["id"]),
@@ -3283,6 +3289,9 @@ def _metric_common_provenance(
         "config_sha256": _sha256(Path(str(config["_config_path"]))),
         "input_fingerprint": str(score_sidecar["input_fingerprint"]),
         "evaluation_fingerprint": evaluation_fingerprint,
+        "score_producer_commit": str(components["git_commit"]),
+        "evaluation_commit": evaluation_commit,
+        "evaluation_git_dirty": evaluation_git_dirty,
         "score_encoding": rerank_module.SCORE_ENCODING,
     }
 
@@ -3575,11 +3584,13 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         ),
     }
     baseline_vector_python = _python_metric_vector(baseline_python)
-    system_vector = official_trec["parsed"]["per_query_ndcg_at_10"]
+    system_vector_python = _python_metric_vector(
+        python_by_depth[official_depth]
+    )
     stratification = stratified_delta_summary(
         candidates=candidates,
-        baseline_per_query=baseline_vector,
-        system_per_query=system_vector,
+        baseline_per_query=baseline_vector_python,
+        system_per_query=system_vector_python,
         oracle_per_query=baseline_sparse["oracle_per_query"],
     )
     expected_at_oracle = (
@@ -3713,6 +3724,9 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         },
         "sparse_judgment_delta": sparse_inversion_delta,
         "stratified_mean_delta": stratification,
+        "stratification_metric_source": (
+            "python_full_precision_evaluate_bm25_metrics_for_bm25_system_and_oracle"
+        ),
         "pooling_bias_suspected": pooling_bias_suspected,
         "condensed_ndcg_at_10": {
             "diagnostic": True,
