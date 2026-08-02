@@ -46,13 +46,13 @@ The 1,000-hit run is retained for official reproduction. The project candidate
 cache is then deterministically cut to top-100 per query.
 
 ```bash
-python -m pyserini.eval.trec_eval \
-  -c -M 100 -m ndcg_cut.10 miracl-v1.0-ru-dev \
-  run.miracl.bm25.ru.dev.txt
+trec_eval -c -M 100 -m ndcg_cut.10 \
+  artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv \
+  artifacts/runs/dev_bm25_top1000.trec
 
-python -m pyserini.eval.trec_eval \
-  -c -m recall.100 miracl-v1.0-ru-dev \
-  run.miracl.bm25.ru.dev.txt
+trec_eval -c -m recall.100 \
+  artifacts/raw/miracl-ru/qrels.miracl-v1.0-ru-dev.tsv \
+  artifacts/runs/dev_bm25_top1000.trec
 ```
 
 ## Numerical gate
@@ -62,4 +62,3 @@ Recall@100 = **0.661**. Both must reproduce within an absolute tolerance of
 **0.001**, matching the precision published by the official 2CR table.
 
 No index download, full retrieval, or local indexing was started in Phase 0.
-

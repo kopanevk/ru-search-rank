@@ -600,6 +600,8 @@ def test_colab_runner_gates_top100_cache_after_official_dev_top1000() -> None:
     )
     cells = ["".join(cell["source"]) for cell in notebook["cells"]]
     assert len(cells) == 14
+    assert "TREC_EVAL_TAG = 'v9.0.8'" in cells[3]
+    assert "/usr/local/bin/trec_eval" in cells[3]
     assert "'-m', 'pytest', '-q'" in cells[5]
     assert cells[6].index("prepare-annotations") < cells[6].index(
         "inspect-linux-environment"

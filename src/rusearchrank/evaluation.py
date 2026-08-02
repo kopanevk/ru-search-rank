@@ -163,7 +163,7 @@ def evaluate_bm25_metrics(
 
 
 def parse_trec_eval_metric(output: str, metric: str) -> float:
-    """Extract one ``all`` aggregate from Pyserini/trec_eval output."""
+    """Extract one ``all`` aggregate from official NIST trec_eval output."""
 
     matches: list[float] = []
     for line in output.splitlines():
