@@ -6,6 +6,7 @@ dataset:
   corpus_revision: d921ec7e349ce0d28daf30b2da9da5ee698bef0d
   annotations_revision: 5be20db9509754dadad47689368639fcec739c00
   corpus_split: train
+  train_topics_path: artifacts/raw/miracl-ru/topics.miracl-v1.0-ru-train.tsv
   topics:
     train: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-train.tsv
     dev: https://huggingface.co/datasets/miracl/miracl/resolve/5be20db9509754dadad47689368639fcec739c00/miracl-v1.0-ru/topics/topics.miracl-v1.0-ru-dev.tsv
@@ -47,6 +48,7 @@ sorting:
   secondary: docid_asc
 
 paths:
+  repository_root: ..
   raw_dir: artifacts/raw/miracl-ru
   work_dir: artifacts/work/phase1
 

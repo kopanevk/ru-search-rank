@@ -48,6 +48,20 @@ tool first. Only after the reproduction gate passes does it deterministically
 sort by score descending/docid ascending and truncate to the project top-100
 candidate cache. The raw run's SHA-256 binds the gate to the cache build.
 
+Pyserini does not register `miracl-v1.0-ru-train` as a topic id. The runner
+therefore downloads and validates the revision-pinned official train TSV before
+retrieval, then runs train with:
+
+```bash
+python -m pyserini.search.lucene \
+  --threads 16 --batch-size 128 \
+  --language ru \
+  --topics artifacts/raw/miracl-ru/topics.miracl-v1.0-ru-train.tsv \
+  --index miracl-v1.0-ru \
+  --output artifacts/runs/train_bm25_top100.trec \
+  --bm25 --hits 100
+```
+
 ## Expected external downloads
 
 - Pyserini 2.3.0 source distribution: 112.7 MB as reported by PyPI, plus its
