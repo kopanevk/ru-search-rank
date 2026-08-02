@@ -59,7 +59,7 @@ def main() -> int:
             "BRANCH = 'phase-2'",
             "ALLOW_OVERWRITE_PHASE2 = False",
         ],
-        4: ["openjdk-21-jdk-headless", "TREC_EVAL_TAG = 'v9.0.8'", "rev-list", "trec_eval', '-h'"],
+        4: ["openjdk-21-jdk-headless", "TREC_EVAL_TAG = 'v9.0.8'", "rev-list", "trec_eval', '-v'"],
         5: ["3.12", "RUN_PYTHON", "pip_install_project"],
         6: [
             "'-m', 'pytest', '-q'",
@@ -87,6 +87,10 @@ def main() -> int:
                 fragment in sources[number - 1],
                 f"Cell {number} is missing {fragment!r}",
             )
+    require(
+        "trec_eval', '-h'" not in sources[3],
+        "Cell 4 must probe the actual trec_eval version with -v, not -h help.",
+    )
 
     code_source = "\n".join(sources[1:])
     for banned in ("load_dataset", "trust_remote_code", "pyserini.eval"):

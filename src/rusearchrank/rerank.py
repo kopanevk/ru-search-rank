@@ -8,6 +8,7 @@ table only after complete validation.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import contextlib
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from typing import Any, Protocol
 import zipfile
 
@@ -35,6 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
+from .evaluation import raw_score_tie_statistics
 from .retrieval import read_trec_run, validate_top_k
 
 
@@ -72,6 +75,109 @@ SCORE_ENCODING = {
     "internal_tie_break": (
         "raw_score_desc_then_docid_asc_on_exact_equality"
     ),
+}
+
+# These exact top-level definitions are the scoring implementation contract.
+# Reporting, evaluation, diagnostics, and packaging definitions are deliberately
+# absent: changing them must not invalidate already-computed model logits.
+SCORING_SOURCE_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "src/rusearchrank/rerank.py": (
+        "MODEL_ID",
+        "MODEL_REVISION",
+        "SCORE_COLUMNS",
+        "SCORE_SCHEMA",
+        "PairScorer",
+        "PreparedPair",
+        "format_document",
+        "_plain_encoding",
+        "prepare_pair",
+        "token_accounting",
+        "resolve_device",
+        "select_batch_size",
+        "TransformersPairScorer",
+        "seed_everything",
+        "plan_query_shards",
+        "_score_table_from_rows",
+        "validate_score_table",
+        "load_scoring_inputs",
+        "_write_score_parquet",
+        "_candidate_keys",
+        "_sidecar_path",
+        "_validate_shard_reuse",
+        "_prepare_shard_pairs",
+        "_score_prepared_pairs",
+        "_final_score_is_valid",
+        "run_rerank_scoring",
+    ),
+    "src/rusearchrank/cli.py": ("_rerank_score",),
+}
+SCORING_DEPENDENCIES = {
+    "huggingface-hub",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyyaml",
+    "torch",
+    "transformers",
+}
+SCORING_FINGERPRINT_FIELDS = {
+    "implementation_version",
+    "score_schema_version",
+    "scoring_source_sha256",
+    "scoring_config_sha256",
+    "candidates_sha256",
+    "queries_sha256",
+    "passages_sha256",
+    "model_id",
+    "model_revision",
+    "tokenizer_revision",
+    "max_length",
+    "truncation",
+    "pair_order",
+    "title_separator",
+    "batch_size",
+    "device",
+    "dtype",
+    "shard_queries",
+    "seed",
+    "python_version",
+    "torch_version",
+    "transformers_version",
+    "tokenizers_version",
+}
+NON_SCORING_PROVENANCE_FIELDS = {
+    "source_tree_sha256",
+    "evaluation_source_sha256",
+    "config_sha256",
+    "git_commit",
+    "git_dirty",
+}
+LEGACY_FINGERPRINT_FIELDS = {
+    "implementation_version",
+    "score_schema_version",
+    "source_tree_sha256",
+    "git_commit",
+    "git_dirty",
+    "config_sha256",
+    "candidates_sha256",
+    "queries_sha256",
+    "passages_sha256",
+    "model_id",
+    "model_revision",
+    "tokenizer_revision",
+    "max_length",
+    "truncation",
+    "pair_order",
+    "title_separator",
+    "batch_size",
+    "device",
+    "dtype",
+    "shard_queries",
+    "seed",
+    "python_version",
+    "torch_version",
+    "transformers_version",
+    "tokenizers_version",
 }
 
 
@@ -432,6 +538,267 @@ def source_tree_sha256(config: Mapping[str, Any]) -> tuple[str, dict[str, str]]:
     return digest.hexdigest(), hashes
 
 
+def evaluation_source_sha256(
+    config: Mapping[str, Any],
+) -> tuple[str, dict[str, str]]:
+    """Hash the complete Phase 2 implementation used by evaluation/package."""
+
+    return source_tree_sha256(config)
+
+
+def scoring_config_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only config values capable of changing score production."""
+
+    inference_keys = (
+        "batch_size",
+        "cpu_batch_size",
+        "device",
+        "cuda_dtype",
+        "fallback_dtype",
+        "score_dtype",
+        "shard_queries",
+        "seed",
+    )
+    inference = config["inference"]
+    return {
+        "implementation_version": str(config["implementation"]["version"]),
+        "score_schema_version": int(
+            config["implementation"]["score_schema_version"]
+        ),
+        "model": dict(config["model"]),
+        "input": dict(config["input"]),
+        "inference": {name: inference[name] for name in inference_keys},
+        "split": str(config["protocol"]["split"]),
+    }
+
+
+def scoring_config_sha256(config: Mapping[str, Any]) -> str:
+    return canonical_json_sha256(scoring_config_contract(config))
+
+
+def _top_level_source_fragments(
+    source: str, *, relative_path: str, symbols: Sequence[str]
+) -> dict[str, str]:
+    """Extract exact source spans for named top-level definitions."""
+
+    tree = ast.parse(source, filename=relative_path)
+    nodes: dict[str, ast.AST] = {}
+    for node in tree.body:
+        names: list[str] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, ast.Assign):
+            names = [
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            ]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        for name in names:
+            if name in nodes:
+                raise ValueError(
+                    f"duplicate top-level scoring symbol {name!r} in {relative_path}"
+                )
+            nodes[name] = node
+    missing = sorted(set(symbols).difference(nodes))
+    if missing:
+        raise ValueError(
+            f"scoring source symbols are missing from {relative_path}: {missing}"
+        )
+    lines = source.splitlines(keepends=True)
+    fragments: dict[str, str] = {}
+    for name in symbols:
+        node = nodes[name]
+        start = int(getattr(node, "lineno"))
+        decorators = getattr(node, "decorator_list", [])
+        if decorators:
+            start = min(start, *(int(decorator.lineno) for decorator in decorators))
+        end = int(getattr(node, "end_lineno"))
+        fragments[name] = "".join(lines[start - 1 : end])
+    return fragments
+
+
+def _dependency_constraints(pyproject_bytes: bytes) -> list[str]:
+    project = tomllib.loads(pyproject_bytes.decode("utf-8"))["project"]
+    selected: list[str] = []
+    for value in project.get("dependencies", []):
+        dependency = str(value)
+        match = re.match(r"[A-Za-z0-9_.-]+", dependency)
+        if match and match.group(0).lower() in SCORING_DEPENDENCIES:
+            selected.append(dependency)
+    found = {
+        re.match(r"[A-Za-z0-9_.-]+", value).group(0).lower()  # type: ignore[union-attr]
+        for value in selected
+    }
+    missing = sorted(SCORING_DEPENDENCIES.difference(found))
+    if missing:
+        raise ValueError(f"scoring dependency constraints are missing: {missing}")
+    return sorted(selected, key=str.lower)
+
+
+def _current_scoring_source_bytes(config: Mapping[str, Any]) -> dict[str, bytes]:
+    root = repository_root(config)
+    relatives = {*SCORING_SOURCE_SYMBOLS, "pyproject.toml"}
+    bundle: dict[str, bytes] = {}
+    for relative in sorted(relatives):
+        path = root / relative
+        if not path.is_file():
+            raise ValueError(f"scoring source file is missing: {relative}")
+        bundle[relative] = path.read_bytes()
+    return bundle
+
+
+def scoring_source_sha256(
+    config: Mapping[str, Any],
+    *,
+    source_bytes: Mapping[str, bytes] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Hash exact scoring source fragments, config, and dependency constraints."""
+
+    bundle = dict(source_bytes or _current_scoring_source_bytes(config))
+    source_hashes: dict[str, dict[str, str]] = {}
+    for relative, symbols in sorted(SCORING_SOURCE_SYMBOLS.items()):
+        if relative not in bundle:
+            raise ValueError(f"scoring source bundle is missing {relative}")
+        fragments = _top_level_source_fragments(
+            bundle[relative].decode("utf-8"),
+            relative_path=relative,
+            symbols=symbols,
+        )
+        source_hashes[relative] = {
+            name: hashlib.sha256(fragment.encode("utf-8")).hexdigest()
+            for name, fragment in fragments.items()
+        }
+    if "pyproject.toml" not in bundle:
+        raise ValueError("scoring source bundle is missing pyproject.toml")
+    details: dict[str, Any] = {
+        "algorithm": "exact_top_level_source_fragments_v1",
+        "source_symbols": source_hashes,
+        "scoring_config_sha256": scoring_config_sha256(config),
+        "dependency_constraints": _dependency_constraints(
+            bundle["pyproject.toml"]
+        ),
+    }
+    return canonical_json_sha256(details), details
+
+
+def _git_show_bytes(root: Path, commit: str, relative: str) -> bytes:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError(f"legacy producer git commit is invalid: {commit!r}")
+    member = Path(relative)
+    if member.is_absolute() or ".." in member.parts:
+        raise ValueError(f"unsafe git source path: {relative!r}")
+    result = subprocess.run(
+        ["git", "show", f"{commit}:{relative}"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            f"cannot read legacy producer source {relative} at {commit}: "
+            f"{result.stderr.decode('utf-8', errors='replace')}"
+        )
+    return result.stdout
+
+
+def legacy_scoring_provenance(
+    config: Mapping[str, Any], *, producer_commit: str
+) -> dict[str, Any]:
+    """Reconstruct a legacy sidecar's scoring contract from its git commit."""
+
+    root = repository_root(config)
+    config_relative = portable_path(config, Path(str(config["_config_path"])))
+    config_bytes = _git_show_bytes(root, producer_commit, config_relative)
+    producer_config = yaml.safe_load(config_bytes.decode("utf-8"))
+    if not isinstance(producer_config, dict):
+        raise ValueError("legacy producer config is not a mapping")
+    relatives = {
+        *SCORING_SOURCE_SYMBOLS,
+        "pyproject.toml",
+        *[str(value) for value in producer_config["implementation"]["source_files"]],
+    }
+    bundle = {
+        relative: _git_show_bytes(root, producer_commit, relative)
+        for relative in sorted(relatives)
+    }
+    producer_scoring_hash, scoring_details = scoring_source_sha256(
+        producer_config, source_bytes=bundle
+    )
+    legacy_digest = hashlib.sha256()
+    legacy_files: dict[str, str] = {}
+    for relative in sorted(
+        str(value) for value in producer_config["implementation"]["source_files"]
+    ):
+        file_hash = hashlib.sha256(bundle[relative]).hexdigest()
+        legacy_files[relative] = file_hash
+        legacy_digest.update(relative.encode("utf-8"))
+        legacy_digest.update(b"\0")
+        legacy_digest.update(file_hash.encode("ascii"))
+        legacy_digest.update(b"\n")
+    return {
+        "producer_commit": producer_commit,
+        "producer_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "producer_scoring_source_sha256": producer_scoring_hash,
+        "producer_scoring_config_sha256": scoring_details[
+            "scoring_config_sha256"
+        ],
+        "producer_legacy_source_tree_sha256": legacy_digest.hexdigest(),
+        "producer_legacy_source_files": legacy_files,
+    }
+
+
+def resolve_legacy_scoring_provenance(
+    config: Mapping[str, Any],
+    *,
+    legacy_source_tree_sha256: str,
+    preferred_commit: str | None = None,
+) -> dict[str, Any]:
+    """Find the recorded legacy source tree in reachable git history."""
+
+    root = repository_root(config)
+    candidates: list[str] = []
+    if preferred_commit and re.fullmatch(r"[0-9a-f]{40}", preferred_commit):
+        candidates.append(preferred_commit)
+    result = subprocess.run(
+        ["git", "rev-list", "--max-count=200", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            "cannot inspect git history for legacy scoring provenance: "
+            f"{result.stderr}"
+        )
+    candidates.extend(
+        commit
+        for commit in result.stdout.splitlines()
+        if commit and commit not in candidates
+    )
+    failures: list[str] = []
+    for commit in candidates:
+        try:
+            provenance = legacy_scoring_provenance(
+                config, producer_commit=commit
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            failures.append(f"{commit[:12]}:{type(exc).__name__}")
+            continue
+        if (
+            provenance["producer_legacy_source_tree_sha256"]
+            == legacy_source_tree_sha256
+        ):
+            return provenance
+    raise ValueError(
+        "legacy score/smoke source tree was not found in reachable git history; "
+        f"sha256={legacy_source_tree_sha256}, checked={len(candidates)}, "
+        f"unreadable={failures[:5]}"
+    )
+
+
 def git_provenance(root: str | Path) -> tuple[str, bool]:
     """Return HEAD and dirty state; fixture directories use an explicit sentinel."""
 
@@ -466,52 +833,45 @@ def package_version(name: str) -> str:
 
 
 def build_input_fingerprint(components: Mapping[str, Any]) -> str:
-    required = {
-        "implementation_version",
-        "score_schema_version",
-        "source_tree_sha256",
-        "git_commit",
-        "git_dirty",
-        "config_sha256",
-        "candidates_sha256",
-        "queries_sha256",
-        "passages_sha256",
-        "model_id",
-        "model_revision",
-        "tokenizer_revision",
-        "max_length",
-        "truncation",
-        "pair_order",
-        "title_separator",
-        "batch_size",
-        "device",
-        "dtype",
-        "shard_queries",
-        "seed",
-        "python_version",
-        "torch_version",
-        "transformers_version",
-        "tokenizers_version",
-    }
-    missing = sorted(required.difference(components))
-    extra = sorted(set(components).difference(required))
+    missing = sorted(SCORING_FINGERPRINT_FIELDS.difference(components))
+    extra = sorted(
+        set(components).difference(
+            SCORING_FINGERPRINT_FIELDS | NON_SCORING_PROVENANCE_FIELDS
+        )
+    )
     if missing or extra:
         raise ValueError(
             f"input fingerprint component mismatch: missing={missing}, extra={extra}"
         )
-    return canonical_json_sha256(components)
+    scoring_components = {
+        name: components[name] for name in sorted(SCORING_FINGERPRINT_FIELDS)
+    }
+    return canonical_json_sha256(scoring_components)
+
+
+def build_legacy_input_fingerprint(components: Mapping[str, Any]) -> str:
+    missing = sorted(LEGACY_FINGERPRINT_FIELDS.difference(components))
+    if missing:
+        raise ValueError(f"legacy input fingerprint is missing fields: {missing}")
+    legacy = {name: components[name] for name in sorted(LEGACY_FINGERPRINT_FIELDS)}
+    return canonical_json_sha256(legacy)
 
 
 def fingerprint_components(
     config: Mapping[str, Any], *, device: str, dtype: str, batch_size: int
 ) -> tuple[str, dict[str, Any]]:
-    tree_hash, _ = source_tree_sha256(config)
+    scoring_hash, scoring_details = scoring_source_sha256(config)
+    evaluation_hash, _ = evaluation_source_sha256(config)
     root = repository_root(config)
     git_commit, git_dirty = git_provenance(root)
     values: dict[str, Any] = {
         "implementation_version": str(config["implementation"]["version"]),
         "score_schema_version": int(config["implementation"]["score_schema_version"]),
-        "source_tree_sha256": tree_hash,
+        "scoring_source_sha256": scoring_hash,
+        "scoring_config_sha256": scoring_details["scoring_config_sha256"],
+        "evaluation_source_sha256": evaluation_hash,
+        # Compatibility alias for pre-audit reports; it is not load-bearing for scores.
+        "source_tree_sha256": evaluation_hash,
         "git_commit": git_commit,
         "git_dirty": git_dirty,
         "config_sha256": sha256_file(Path(str(config["_config_path"]))),
@@ -1800,25 +2160,60 @@ def resolve_trec_eval(config: Mapping[str, Any]) -> Path:
     return executable
 
 
-def probe_trec_eval(executable: Path) -> dict[str, Any]:
+def parse_trec_eval_version(stdout: str, stderr: str = "") -> str | None:
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    patterns = (
+        r"\btrec_eval(?:\s+(?:version|v))?\s*[:=]?\s*v?(\d+\.\d+\.\d+)\b",
+        r"^\s*v?(\d+\.\d+\.\d+)\s*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, combined, flags=re.IGNORECASE | re.MULTILINE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def probe_trec_eval(executable: Path, *, expected_version: str) -> dict[str, Any]:
+    command = [str(executable), "-v"]
     result = subprocess.run(
-        [str(executable), "-h"],
+        command,
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
     )
-    if result.returncode != 0:
-        raise ValueError(
-            f"trec_eval -h failed with return code {result.returncode}: "
-            f"{result.stderr or result.stdout}"
-        )
+    parsed_version = parse_trec_eval_version(result.stdout, result.stderr)
     return {
-        "command": [str(executable), "-h"],
+        "command": command,
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        "parsed_version": parsed_version,
+        "expected_version": str(expected_version),
+        "version_matches_expected": (
+            result.returncode == 0 and parsed_version == str(expected_version)
+        ),
     }
+
+
+def require_trec_eval_version(probe: Mapping[str, Any]) -> None:
+    if int(probe.get("returncode", -1)) != 0:
+        raise ValueError(
+            "trec_eval -v failed before official evaluation: "
+            f"returncode={probe.get('returncode')}, stdout={probe.get('stdout')!r}, "
+            f"stderr={probe.get('stderr')!r}"
+        )
+    if probe.get("parsed_version") is None:
+        raise ValueError(
+            "trec_eval -v output did not contain a recognizable semantic version: "
+            f"stdout={probe.get('stdout')!r}, stderr={probe.get('stderr')!r}"
+        )
+    if probe.get("version_matches_expected") is not True:
+        raise ValueError(
+            "trec_eval version differs from the production protocol: "
+            f"parsed={probe.get('parsed_version')!r}, "
+            f"expected={probe.get('expected_version')!r}"
+        )
 
 
 def resolve_model_revision(
@@ -1857,8 +2252,13 @@ def preflight_rerank(
     model = resolve_model_revision(config, api=model_api)
     memory = require_available_memory(config)
     executable = resolve_trec_eval(config)
-    trec_probe = probe_trec_eval(executable)
-    tree_hash, source_files = source_tree_sha256(config)
+    expected_trec_version = str(config["evaluation"]["trec_eval_version"])
+    trec_probe = probe_trec_eval(
+        executable, expected_version=expected_trec_version
+    )
+    require_trec_eval_version(trec_probe)
+    scoring_hash, scoring_details = scoring_source_sha256(config)
+    evaluation_hash, source_files = evaluation_source_sha256(config)
     root = repository_root(config)
     disk = shutil.disk_usage(root)
     candidates_path = resolve_path(config, config["inputs"]["candidates"])
@@ -1876,7 +2276,7 @@ def preflight_rerank(
         "qrels_present": True,
         "trec_eval": {
             "path": str(executable),
-            "expected_version": str(config["evaluation"]["trec_eval_version"]),
+            "expected_version": expected_trec_version,
             "probe": trec_probe,
         },
         "memory": memory,
@@ -1885,22 +2285,25 @@ def preflight_rerank(
             "required_bytes": required_disk,
             "passed": True,
         },
-        "source_tree_sha256": tree_hash,
+        "scoring_source_sha256": scoring_hash,
+        "scoring_config_sha256": scoring_details["scoring_config_sha256"],
+        "evaluation_source_sha256": evaluation_hash,
+        "source_tree_sha256": evaluation_hash,
         "source_files": source_files,
         "weights_downloaded": False,
     }
 
 
-def smoke_expected_fields(config: Mapping[str, Any]) -> dict[str, Any]:
-    tree_hash, _ = source_tree_sha256(config)
+def scoring_expected_fields(config: Mapping[str, Any]) -> dict[str, Any]:
+    scoring_hash, scoring_details = scoring_source_sha256(config)
     return {
         "model_id": str(config["model"]["id"]),
         "model_revision": str(config["model"]["revision"]),
         "tokenizer_revision": str(config["model"]["tokenizer_revision"]),
-        "config_sha256": sha256_file(Path(str(config["_config_path"]))),
         "implementation_version": str(config["implementation"]["version"]),
         "score_schema_version": int(config["implementation"]["score_schema_version"]),
-        "source_tree_sha256": tree_hash,
+        "scoring_source_sha256": scoring_hash,
+        "scoring_config_sha256": scoring_details["scoring_config_sha256"],
         "candidates_sha256": sha256_file(resolve_path(config, config["inputs"]["candidates"])),
         "queries_sha256": sha256_file(resolve_path(config, config["inputs"]["queries"])),
         "passages_sha256": sha256_file(resolve_path(config, config["inputs"]["passages"])),
@@ -1911,12 +2314,24 @@ def smoke_expected_fields(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def smoke_expected_fields(config: Mapping[str, Any]) -> dict[str, Any]:
+    evaluation_hash, _ = evaluation_source_sha256(config)
+    return {
+        **scoring_expected_fields(config),
+        "config_sha256": sha256_file(Path(str(config["_config_path"]))),
+        "evaluation_source_sha256": evaluation_hash,
+        # Backward-compatible full-tree alias; smoke validation does not use it
+        # to decide whether logits may be reused.
+        "source_tree_sha256": evaluation_hash,
+    }
+
+
 def validate_current_score_sidecar(
     config: Mapping[str, Any],
     *,
     score_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Reject scores produced by another config, source tree, input, or model."""
+    """Validate score bytes/coverage and only scoring-relevant provenance."""
 
     scores = (
         Path(score_path)
@@ -1925,6 +2340,20 @@ def validate_current_score_sidecar(
     )
     sidecar_path = _sidecar_path(scores)
     _require_regular_file(scores, "final score Parquet")
+    candidates = pd.read_parquet(
+        resolve_path(config, config["inputs"]["candidates"]),
+        columns=["split", "query_id", "docid"],
+    )
+    candidates = candidates.loc[
+        candidates["split"].astype("string").eq(str(config["protocol"]["split"]))
+    ]
+    expected_keys = _candidate_keys(candidates)
+    validate_score_table(
+        scores,
+        expected_keys=expected_keys,
+        expected_rows=len(candidates),
+        max_length=int(config["input"]["max_length"]),
+    )
     sidecar = _read_json(sidecar_path)
     if sidecar.get("status") != "PASS":
         raise ValueError("final score sidecar status must be PASS")
@@ -1933,15 +2362,13 @@ def validate_current_score_sidecar(
     components = sidecar.get("fingerprint_components")
     if not isinstance(components, Mapping):
         raise ValueError("final score sidecar has no fingerprint components")
-    expected = smoke_expected_fields(config)
+    expected = scoring_expected_fields(config)
     component_names = {
         "model_id": "model_id",
         "model_revision": "model_revision",
         "tokenizer_revision": "tokenizer_revision",
-        "config_sha256": "config_sha256",
         "implementation_version": "implementation_version",
         "score_schema_version": "score_schema_version",
-        "source_tree_sha256": "source_tree_sha256",
         "candidates_sha256": "candidates_sha256",
         "queries_sha256": "queries_sha256",
         "passages_sha256": "passages_sha256",
@@ -1955,17 +2382,73 @@ def validate_current_score_sidecar(
         for name, expected_name in component_names.items()
         if components.get(name) != expected[expected_name]
     }
-    if sidecar.get("source_tree_sha256") != expected["source_tree_sha256"]:
-        mismatches["sidecar.source_tree_sha256"] = {
-            "expected": expected["source_tree_sha256"],
-            "actual": sidecar.get("source_tree_sha256"),
+    migration: dict[str, Any]
+    if "scoring_source_sha256" in components:
+        for name in ("scoring_source_sha256", "scoring_config_sha256"):
+            if components.get(name) != expected[name]:
+                mismatches[name] = {
+                    "expected": expected[name],
+                    "actual": components.get(name),
+                }
+        computed_fingerprint = build_input_fingerprint(components)
+        if sidecar.get("input_fingerprint") != computed_fingerprint:
+            mismatches["input_fingerprint"] = {
+                "expected": computed_fingerprint,
+                "actual": sidecar.get("input_fingerprint"),
+            }
+        migration = {"mode": "native_split_provenance"}
+    else:
+        legacy_fingerprint = build_legacy_input_fingerprint(components)
+        if sidecar.get("input_fingerprint") != legacy_fingerprint:
+            mismatches["legacy_input_fingerprint"] = {
+                "expected": legacy_fingerprint,
+                "actual": sidecar.get("input_fingerprint"),
+            }
+        legacy_tree = str(components.get("source_tree_sha256", ""))
+        if sidecar.get("source_tree_sha256") != legacy_tree:
+            mismatches["legacy_sidecar.source_tree_sha256"] = {
+                "expected": legacy_tree,
+                "actual": sidecar.get("source_tree_sha256"),
+            }
+        provenance = resolve_legacy_scoring_provenance(
+            config,
+            legacy_source_tree_sha256=legacy_tree,
+            preferred_commit=str(components.get("git_commit", "")),
+        )
+        legacy_checks = {
+            "config_sha256": (
+                components.get("config_sha256"),
+                provenance["producer_config_sha256"],
+            ),
+            "producer_scoring_source_sha256": (
+                provenance["producer_scoring_source_sha256"],
+                expected["scoring_source_sha256"],
+            ),
+            "producer_scoring_config_sha256": (
+                provenance["producer_scoring_config_sha256"],
+                expected["scoring_config_sha256"],
+            ),
         }
+        for name, (actual, wanted) in legacy_checks.items():
+            if actual != wanted:
+                mismatches[name] = {"expected": wanted, "actual": actual}
+        migration = {"mode": "verified_legacy_git_source", **provenance}
     if mismatches:
         raise ValueError(
             "final scores are stale for the current protocol: "
             + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
         )
-    return sidecar
+    evaluation_hash, _ = evaluation_source_sha256(config)
+    normalized = dict(sidecar)
+    normalized["producer_source_tree_sha256"] = sidecar.get(
+        "source_tree_sha256"
+    )
+    normalized["scoring_source_sha256"] = expected["scoring_source_sha256"]
+    normalized["scoring_config_sha256"] = expected["scoring_config_sha256"]
+    normalized["evaluation_source_sha256"] = evaluation_hash
+    normalized["source_tree_sha256"] = evaluation_hash
+    normalized["provenance_migration"] = migration
+    return normalized
 
 
 def validate_smoke_gate(
@@ -1989,19 +2472,59 @@ def validate_smoke_gate(
         raise ValueError(f"rerank smoke did not execute a real model forward; repeat: {repeat}")
     if report.get("fixture_only") is not False:
         raise ValueError(f"fixture-only smoke cannot unlock full scoring; repeat: {repeat}")
-    expected = smoke_expected_fields(config)
+    expected = scoring_expected_fields(config)
+    common_names = set(expected).difference(
+        {"scoring_source_sha256", "scoring_config_sha256"}
+    )
     mismatches = {
-        name: {"expected": value, "actual": report.get(name)}
-        for name, value in expected.items()
-        if report.get(name) != value
+        name: {"expected": expected[name], "actual": report.get(name)}
+        for name in sorted(common_names)
+        if report.get(name) != expected[name]
     }
+    migration: dict[str, Any]
+    if "scoring_source_sha256" in report:
+        for name in ("scoring_source_sha256", "scoring_config_sha256"):
+            if report.get(name) != expected[name]:
+                mismatches[name] = {
+                    "expected": expected[name],
+                    "actual": report.get(name),
+                }
+        migration = {"mode": "native_split_provenance"}
+    else:
+        legacy_tree = str(report.get("source_tree_sha256", ""))
+        provenance = resolve_legacy_scoring_provenance(
+            config,
+            legacy_source_tree_sha256=legacy_tree,
+        )
+        legacy_checks = {
+            "config_sha256": (
+                report.get("config_sha256"),
+                provenance["producer_config_sha256"],
+            ),
+            "producer_scoring_source_sha256": (
+                provenance["producer_scoring_source_sha256"],
+                expected["scoring_source_sha256"],
+            ),
+            "producer_scoring_config_sha256": (
+                provenance["producer_scoring_config_sha256"],
+                expected["scoring_config_sha256"],
+            ),
+        }
+        for name, (actual, wanted) in legacy_checks.items():
+            if actual != wanted:
+                mismatches[name] = {"expected": wanted, "actual": actual}
+        migration = {"mode": "verified_legacy_git_source", **provenance}
     if mismatches:
         raise ValueError(
             "rerank smoke is stale or incompatible: "
             + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
             + f"; repeat: {repeat}"
         )
-    return report
+    normalized = dict(report)
+    normalized["scoring_source_sha256"] = expected["scoring_source_sha256"]
+    normalized["scoring_config_sha256"] = expected["scoring_config_sha256"]
+    normalized["provenance_migration"] = migration
+    return normalized
 
 
 def run_smoke_rerank(
@@ -2317,6 +2840,10 @@ def _manifest_entry(
     path: Path,
     *,
     score_sidecar: Mapping[str, Any],
+    raw_score_ties: Mapping[str, Any],
+    evaluation_commit: str,
+    package_commit: str,
+    package_git_dirty: bool,
     producer_command: str,
     input_hashes: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -2346,14 +2873,29 @@ def _manifest_entry(
         "platform": platform.platform(),
         "implementation_version": str(config["implementation"]["version"]),
         "score_schema_version": int(config["implementation"]["score_schema_version"]),
-        "source_tree_sha256": str(score_sidecar["source_tree_sha256"]),
+        "scoring_source_sha256": str(
+            score_sidecar["scoring_source_sha256"]
+        ),
+        "scoring_config_sha256": str(
+            score_sidecar["scoring_config_sha256"]
+        ),
+        "evaluation_source_sha256": str(
+            score_sidecar["evaluation_source_sha256"]
+        ),
+        "source_tree_sha256": str(score_sidecar["evaluation_source_sha256"]),
         "git_commit": str(components["git_commit"]),
         "git_dirty": bool(components["git_dirty"]),
-        "config_sha256": str(components["config_sha256"]),
+        "score_producer_commit": str(components["git_commit"]),
+        "evaluation_commit": evaluation_commit,
+        "package_commit": package_commit,
+        "package_git_dirty": package_git_dirty,
+        "producer_config_sha256": str(components["config_sha256"]),
+        "config_sha256": sha256_file(Path(str(config["_config_path"]))),
         "input_fingerprint": str(score_sidecar["input_fingerprint"]),
         "peak_rss_bytes": int(score_sidecar["peak_rss_bytes"]),
         "score_encoding": dict(SCORE_ENCODING),
         "token_accounting": dict(score_sidecar["token_accounting"]),
+        **dict(raw_score_ties),
     }
 
 
@@ -2402,15 +2944,34 @@ def validate_phase2_manifest(
         "platform",
         "implementation_version",
         "score_schema_version",
+        "scoring_source_sha256",
+        "scoring_config_sha256",
+        "evaluation_source_sha256",
         "source_tree_sha256",
         "git_commit",
         "git_dirty",
+        "score_producer_commit",
+        "evaluation_commit",
+        "package_commit",
+        "package_git_dirty",
         "config_sha256",
+        "producer_config_sha256",
         "input_fingerprint",
         "peak_rss_bytes",
         "score_encoding",
         "token_accounting",
+        "raw_score_tie_definition",
+        "raw_score_tie_groups",
+        "rows_in_raw_score_ties",
+        "queries_with_any_raw_score_tie",
+        "queries_with_top10_raw_score_tie",
+        "ties_crossing_rank10_boundary",
+        "largest_raw_score_tie_group",
     }
+    score_frame = pq.read_table(
+        expected_payloads[0], columns=["query_id", "docid", "score"]
+    ).to_pandas()
+    expected_ties = raw_score_tie_statistics(score_frame)
     for path, entry in zip(expected_payloads, files, strict=True):
         if not isinstance(entry, dict) or required.difference(entry):
             raise ValueError(
@@ -2424,6 +2985,8 @@ def validate_phase2_manifest(
             raise ValueError(f"manifest tabular contract is stale for {path}")
         if entry["score_encoding"] != SCORE_ENCODING:
             raise ValueError(f"manifest score encoding changed for {path}")
+        if any(entry[name] != value for name, value in expected_ties.items()):
+            raise ValueError(f"manifest raw-score tie statistics are stale for {path}")
         hashes = entry["input_hashes"]
         if not isinstance(hashes, dict) or not hashes or not all(
             isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
@@ -2505,6 +3068,23 @@ def package_phase2(
     score_path = resolve_path(config, config["artifacts"]["scores"])
     score_sidecar_path = _sidecar_path(score_path)
     score_sidecar = validate_current_score_sidecar(config, score_path=score_path)
+    raw_score_ties = raw_score_tie_statistics(
+        pq.read_table(
+            score_path, columns=["query_id", "docid", "score"]
+        ).to_pandas()
+    )
+    system_metrics = _read_json(
+        resolve_path(config, config["metrics"]["system"])
+    )
+    evaluation_commit = str(system_metrics.get("evaluation_commit", ""))
+    if evaluation_commit != "UNAVAILABLE" and not re.fullmatch(
+        r"[0-9a-f]{40}", evaluation_commit
+    ):
+        raise ValueError(
+            "system metrics do not contain a valid evaluation_commit; "
+            "rerun evaluate-rerank before package-phase2"
+        )
+    package_commit, package_git_dirty = git_provenance(repository_root(config))
     protocol_path = resolve_path(config, config["audits"]["protocol_snapshot"])
     manifest_path = resolve_path(config, config["audits"]["manifest"])
     archive_path = resolve_path(config, config["archive"]["path"])
@@ -2580,6 +3160,10 @@ def package_phase2(
                 config,
                 path,
                 score_sidecar=score_sidecar,
+                raw_score_ties=raw_score_ties,
+                evaluation_commit=evaluation_commit,
+                package_commit=package_commit,
+                package_git_dirty=package_git_dirty,
                 producer_command=producers[portable_path(config, path)],
                 input_hashes=input_hashes[portable_path(config, path)],
             )

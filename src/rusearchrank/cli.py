@@ -56,10 +56,12 @@ from .data import (
 from .evaluation import (
     assert_candidate_set_invariant,
     build_qrels_split_audit,
+    classify_bm25_tie_break_audit,
     evaluate_bm25_metrics,
     paired_ranking_comparison,
     parse_trec_eval_metric,
     parse_trec_eval_per_query,
+    raw_score_tie_statistics,
     reproduction_rows,
     sparse_judgment_diagnostics,
     stratified_delta_summary,
@@ -3250,8 +3252,15 @@ def _metric_common_provenance(
     score_sidecar: dict[str, Any],
     input_artifacts: dict[str, Any],
     evaluation_fingerprint: str,
-    ties: int,
+    score_ties: dict[str, Any],
+    ranking_score_tie_rows: int,
 ) -> dict[str, Any]:
+    components = score_sidecar.get("fingerprint_components")
+    if not isinstance(components, dict):
+        raise ValueError("score sidecar is missing fingerprint components")
+    evaluation_commit, evaluation_git_dirty = rerank_module.git_provenance(
+        rerank_module.repository_root(config)
+    )
     return {
         "input_artifacts": input_artifacts,
         "model_id": str(config["model"]["id"]),
@@ -3261,15 +3270,28 @@ def _metric_common_provenance(
         "dtype": str(score_sidecar["dtype"]),
         "batch_size": int(score_sidecar["batch_size"]),
         "max_length": int(config["input"]["max_length"]),
-        "raw_score_ties": int(ties),
+        **score_ties,
+        "ranking_score_tie_rows": int(ranking_score_tie_rows),
         "token_accounting": score_sidecar["token_accounting"],
         "peak_rss_bytes": int(score_sidecar["peak_rss_bytes"]),
         "implementation_version": str(config["implementation"]["version"]),
         "score_schema_version": int(config["implementation"]["score_schema_version"]),
-        "source_tree_sha256": str(score_sidecar["source_tree_sha256"]),
+        "scoring_source_sha256": str(
+            score_sidecar["scoring_source_sha256"]
+        ),
+        "scoring_config_sha256": str(
+            score_sidecar["scoring_config_sha256"]
+        ),
+        "evaluation_source_sha256": str(
+            score_sidecar["evaluation_source_sha256"]
+        ),
+        "source_tree_sha256": str(score_sidecar["evaluation_source_sha256"]),
         "config_sha256": _sha256(Path(str(config["_config_path"]))),
         "input_fingerprint": str(score_sidecar["input_fingerprint"]),
         "evaluation_fingerprint": evaluation_fingerprint,
+        "score_producer_commit": str(components["git_commit"]),
+        "evaluation_commit": evaluation_commit,
+        "evaluation_git_dirty": evaluation_git_dirty,
         "score_encoding": rerank_module.SCORE_ENCODING,
     }
 
@@ -3372,7 +3394,8 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
     candidates_path = rerank_module.resolve_path(config, config["inputs"]["candidates"])
     current_hashes = {
         "config": _sha256(Path(str(config["_config_path"]))),
-        "source_tree": rerank_module.source_tree_sha256(config)[0],
+        "evaluation_source": rerank_module.evaluation_source_sha256(config)[0],
+        "scoring_source": score_sidecar["scoring_source_sha256"],
         "scores": _sha256(score_path),
         "bm25_run": _sha256(bm25_path),
         "qrels": _sha256(qrels_path),
@@ -3418,7 +3441,11 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             rerank_module.preserve_stale(path)
 
     executable = rerank_module.resolve_trec_eval(config)
-    version_probe = rerank_module.probe_trec_eval(executable)
+    version_probe = rerank_module.probe_trec_eval(
+        executable,
+        expected_version=str(config["evaluation"]["trec_eval_version"]),
+    )
+    rerank_module.require_trec_eval_version(version_probe)
     baseline_trec = _execute_rerank_trec_eval(
         config,
         run_path=bm25_path,
@@ -3465,36 +3492,34 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
     asc_diff = _vector_difference(
         _python_metric_vector(baseline_python_asc), baseline_vector
     )
-    desc_match = desc_diff <= tolerance
-    asc_match = asc_diff <= tolerance
-    if not desc_match and not asc_match:
+    tie_break_audit = classify_bm25_tie_break_audit(
+        docno_desc_max_abs_difference=desc_diff,
+        docno_asc_max_abs_difference=asc_diff,
+        tolerance=tolerance,
+    )
+    if tie_break_audit["conclusion"] == "no_policy_matches":
         raise ValueError(
-            "neither empirical BM25 docno tie-break reproduces trec_eval -q: "
-            f"desc_diff={desc_diff}, asc_diff={asc_diff}, tolerance={tolerance}"
+            "BM25 tie-break audit concluded no_policy_matches: "
+            + json.dumps(tie_break_audit, ensure_ascii=False, sort_keys=True)
         )
-    baseline_ranking = baseline_rank_desc if desc_match else baseline_rank_asc
-    baseline_python = baseline_python_desc if desc_match else baseline_python_asc
+    if tie_break_audit["conclusion"] == "docno_desc":
+        baseline_ranking = baseline_rank_desc
+        baseline_python = baseline_python_desc
+        tie_break_audit["python_representative"] = "docno_desc"
+    else:
+        baseline_ranking = baseline_rank_asc
+        baseline_python = baseline_python_asc
+        tie_break_audit["python_representative"] = (
+            "docno_asc"
+            if tie_break_audit["conclusion"] == "docno_asc"
+            else "docno_asc_metric_equivalent_representative_not_inferred_policy"
+        )
     aggregate_baseline_difference = abs(
         float(baseline_python["aggregate"]["ndcg_at_10"])
         - float(baseline_trec["parsed"]["ndcg_at_10"])
     )
     if aggregate_baseline_difference > tolerance:
         raise ValueError("Python BM25 nDCG@10 differs from official trec_eval")
-    tie_break_audit = {
-        "empirical_method": "compare full per-query nDCG@10 vectors",
-        "docno_desc_max_abs_difference": desc_diff,
-        "docno_asc_max_abs_difference": asc_diff,
-        "docno_desc_matches": desc_match,
-        "docno_asc_matches": asc_match,
-        "conclusion": (
-            "docno_desc_selected_both_metric_equivalent"
-            if desc_match and asc_match
-            else "docno_desc"
-            if desc_match
-            else "docno_asc"
-        ),
-    }
-
     python_by_depth: dict[int, dict[str, Any]] = {}
     sparse_by_depth: dict[int, dict[str, Any]] = {}
     comparison_by_depth: dict[int, dict[str, Any]] = {}
@@ -3559,13 +3584,30 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         ),
     }
     baseline_vector_python = _python_metric_vector(baseline_python)
-    system_vector = official_trec["parsed"]["per_query_ndcg_at_10"]
+    system_vector_python = _python_metric_vector(
+        python_by_depth[official_depth]
+    )
     stratification = stratified_delta_summary(
         candidates=candidates,
-        baseline_per_query=baseline_vector,
-        system_per_query=system_vector,
+        baseline_per_query=baseline_vector_python,
+        system_per_query=system_vector_python,
         oracle_per_query=baseline_sparse["oracle_per_query"],
     )
+    expected_at_oracle = (
+        int(stratification["no_relevant_in_candidates"]["query_count"])
+        + int(stratification["already_at_oracle"]["query_count"])
+    )
+    if int(baseline_sparse["queries_at_oracle_under_bm25"]) != expected_at_oracle:
+        raise RuntimeError(
+            "queries_at_oracle_under_bm25 is inconsistent with the disjoint "
+            "no-relevant/already-at-oracle strata"
+        )
+    if int(baseline_sparse["queries_without_relevant_candidate"]) != int(
+        stratification["no_relevant_in_candidates"]["query_count"]
+    ):
+        raise RuntimeError(
+            "no_relevant_in_candidates stratum disagrees with sparse diagnostics"
+        )
     pooling_bias_suspected = bool(
         float(official_comparison["mean_delta"]) > 0
         and float(official_sparse["judged_at_10"])
@@ -3574,7 +3616,7 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
 
     score_table = pq.read_table(score_path, columns=["query_id", "docid", "score"])
     raw_scores = score_table.to_pandas()
-    official_raw_ties = _raw_score_tie_count(raw_scores, "score")
+    raw_tie_stats = raw_score_tie_statistics(raw_scores)
     baseline_ties = _raw_score_tie_count(bm25_run, "bm25_score")
     input_artifacts = {
         "scores": _rerank_file_metadata(config, score_path),
@@ -3591,14 +3633,16 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         score_sidecar=score_sidecar,
         input_artifacts=input_artifacts,
         evaluation_fingerprint=evaluation_fingerprint,
-        ties=baseline_ties,
+        score_ties=raw_tie_stats,
+        ranking_score_tie_rows=baseline_ties,
     )
     system_common = _metric_common_provenance(
         config,
         score_sidecar=score_sidecar,
         input_artifacts=input_artifacts,
         evaluation_fingerprint=evaluation_fingerprint,
-        ties=official_raw_ties,
+        score_ties=raw_tie_stats,
+        ranking_score_tie_rows=int(raw_tie_stats["rows_in_raw_score_ties"]),
     )
     sanity_reference = float(config["evaluation"]["expected_bm25_ndcg_at_10"])
     sanity_difference = float(baseline_trec["parsed"]["ndcg_at_10"]) - sanity_reference
@@ -3680,6 +3724,9 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         },
         "sparse_judgment_delta": sparse_inversion_delta,
         "stratified_mean_delta": stratification,
+        "stratification_metric_source": (
+            "python_full_precision_evaluate_bm25_metrics_for_bm25_system_and_oracle"
+        ),
         "pooling_bias_suspected": pooling_bias_suspected,
         "condensed_ndcg_at_10": {
             "diagnostic": True,

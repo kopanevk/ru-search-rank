@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -12,8 +13,10 @@ import pytest
 
 from rusearchrank.evaluation import (
     assert_candidate_set_invariant,
+    classify_bm25_tie_break_audit,
     paired_bootstrap,
     parse_trec_eval_per_query,
+    raw_score_tie_statistics,
 )
 from rusearchrank.rerank import (
     SCORE_SCHEMA,
@@ -21,9 +24,14 @@ from rusearchrank.rerank import (
     derive_rerank_ranking,
     format_document,
     key_set_sha256,
+    legacy_scoring_provenance,
+    load_rerank_config,
     plan_query_shards,
     prepare_pair,
+    probe_trec_eval,
     render_rank_preserving_trec,
+    require_trec_eval_version,
+    scoring_source_sha256,
     score_schema_json,
     source_tree_sha256,
     token_accounting,
@@ -238,6 +246,10 @@ def fingerprint_components() -> dict[str, object]:
     return {
         "implementation_version": "2.0.0",
         "score_schema_version": 1,
+        "scoring_source_sha256": "9" * 64,
+        "scoring_config_sha256": "8" * 64,
+        # Audit-only fields are stored openly but excluded from score reuse.
+        "evaluation_source_sha256": "7" * 64,
         "source_tree_sha256": "a" * 64,
         "git_commit": "b" * 40,
         "git_dirty": True,
@@ -261,16 +273,49 @@ def fingerprint_components() -> dict[str, object]:
         "torch_version": "2.8.0",
         "transformers_version": "5.0.0",
         "tokenizers_version": "0.22.0",
-    }
+}
 
 
-@pytest.mark.parametrize("field", list(fingerprint_components()))
+@pytest.mark.parametrize(
+    "field",
+    [
+        name
+        for name in fingerprint_components()
+        if name
+        not in {
+            "evaluation_source_sha256",
+            "source_tree_sha256",
+            "config_sha256",
+            "git_commit",
+            "git_dirty",
+        }
+    ],
+)
 def test_each_input_fingerprint_component_is_load_bearing(field: str) -> None:
     base = fingerprint_components()
     changed = copy.deepcopy(base)
     value = changed[field]
     changed[field] = not value if isinstance(value, bool) else f"{value}-changed"
     assert build_input_fingerprint(base) != build_input_fingerprint(changed)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "evaluation_source_sha256",
+        "source_tree_sha256",
+        "config_sha256",
+        "git_commit",
+        "git_dirty",
+    ],
+)
+def test_evaluation_only_provenance_does_not_change_score_fingerprint(
+    field: str,
+) -> None:
+    base = fingerprint_components()
+    changed = copy.deepcopy(base)
+    changed[field] = "0" * 64
+    assert build_input_fingerprint(base) == build_input_fingerprint(changed)
 
 
 def test_source_tree_hash_changes_when_any_source_byte_changes(tmp_path: Path) -> None:
@@ -289,6 +334,27 @@ def test_source_tree_hash_changes_when_any_source_byte_changes(tmp_path: Path) -
     assert before != after
     assert before_files["a.py"] == after_files["a.py"]
     assert before_files["b.py"] != after_files["b.py"]
+
+
+def test_current_scoring_contract_matches_pre_audit_head() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    config = load_rerank_config(repository / "configs/rerank.yaml")
+    producer_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    legacy = legacy_scoring_provenance(
+        config, producer_commit=producer_commit
+    )
+    current_hash, current_details = scoring_source_sha256(config)
+    assert legacy["producer_scoring_source_sha256"] == current_hash
+    assert (
+        legacy["producer_scoring_config_sha256"]
+        == current_details["scoring_config_sha256"]
+    )
 
 
 def test_score_schema_and_validation_reject_bad_values(tmp_path: Path) -> None:
@@ -351,6 +417,146 @@ def test_trec_eval_per_query_parser_and_bootstrap_reproducibility() -> None:
     first = json.dumps(paired_bootstrap([0.1, -0.2, 0.3]), sort_keys=True)
     second = json.dumps(paired_bootstrap([0.1, -0.2, 0.3]), sort_keys=True)
     assert first.encode() == second.encode()
+
+
+@pytest.mark.parametrize(
+    ("desc_difference", "asc_difference", "expected"),
+    [
+        (1e-2, 0.0, "docno_asc"),
+        (0.0, 1e-2, "docno_desc"),
+        (0.0, 0.0, "inconclusive_metric_equivalent"),
+        (1e-2, 2e-2, "no_policy_matches"),
+    ],
+)
+def test_bm25_tie_break_audit_has_no_arbitrary_policy(
+    desc_difference: float, asc_difference: float, expected: str
+) -> None:
+    report = classify_bm25_tie_break_audit(
+        docno_desc_max_abs_difference=desc_difference,
+        docno_asc_max_abs_difference=asc_difference,
+        tolerance=1e-4,
+    )
+    assert report["conclusion"] == expected
+    if expected == "inconclusive_metric_equivalent":
+        assert "cannot empirically identify" in report["explanation"]
+
+
+def _version_probe_script(
+    path: Path, *, stdout: str = "", stderr: str = "", returncode: int = 0
+) -> Path:
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%b' {json.dumps(stdout)}\n"
+        f"printf '%b' {json.dumps(stderr)} >&2\n"
+        f"exit {returncode}\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_trec_eval_version_probe_accepts_9_0_8(tmp_path: Path) -> None:
+    executable = _version_probe_script(
+        tmp_path / "trec_eval", stdout="trec_eval 9.0.8\n"
+    )
+    probe = probe_trec_eval(executable, expected_version="9.0.8")
+    require_trec_eval_version(probe)
+    assert probe == {
+        "command": [str(executable), "-v"],
+        "returncode": 0,
+        "stdout": "trec_eval 9.0.8\n",
+        "stderr": "",
+        "parsed_version": "9.0.8",
+        "expected_version": "9.0.8",
+        "version_matches_expected": True,
+    }
+
+
+def test_trec_eval_version_probe_rejects_other_version(tmp_path: Path) -> None:
+    executable = _version_probe_script(
+        tmp_path / "trec_eval", stdout="trec_eval 9.0.7\n"
+    )
+    probe = probe_trec_eval(executable, expected_version="9.0.8")
+    assert probe["version_matches_expected"] is False
+    with pytest.raises(ValueError, match="differs from the production protocol"):
+        require_trec_eval_version(probe)
+
+
+def test_trec_eval_version_probe_rejects_unrecognized_output(
+    tmp_path: Path,
+) -> None:
+    executable = _version_probe_script(
+        tmp_path / "trec_eval", stdout="usage only\n"
+    )
+    probe = probe_trec_eval(executable, expected_version="9.0.8")
+    assert probe["parsed_version"] is None
+    with pytest.raises(ValueError, match="recognizable semantic version"):
+        require_trec_eval_version(probe)
+
+
+def test_trec_eval_version_probe_rejects_nonzero_returncode(
+    tmp_path: Path,
+) -> None:
+    executable = _version_probe_script(
+        tmp_path / "trec_eval", stderr="broken\n", returncode=3
+    )
+    probe = probe_trec_eval(executable, expected_version="9.0.8")
+    assert probe["returncode"] == 3
+    with pytest.raises(ValueError, match="failed before official evaluation"):
+        require_trec_eval_version(probe)
+
+
+def _raw_tie_frame(values: list[float]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "query_id": ["q"] * len(values),
+            "docid": [f"d{index:02d}" for index in range(1, len(values) + 1)],
+            "score": np.asarray(values, dtype=np.float32),
+        }
+    )
+
+
+def test_raw_score_tie_only_in_tail() -> None:
+    report = raw_score_tie_statistics(
+        _raw_tie_frame([12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 0, 0])
+    )
+    assert report == {
+        "raw_score_tie_definition": (
+            "exact_float32_equality_within_query_id_on_stored_raw_logits"
+        ),
+        "raw_score_tie_groups": 1,
+        "rows_in_raw_score_ties": 2,
+        "queries_with_any_raw_score_tie": 1,
+        "queries_with_top10_raw_score_tie": 0,
+        "ties_crossing_rank10_boundary": 0,
+        "largest_raw_score_tie_group": 2,
+    }
+
+
+def test_raw_score_tie_inside_top10() -> None:
+    report = raw_score_tie_statistics(
+        _raw_tie_frame([12, 11, 10, 9, 9, 7, 6, 5, 4, 3, 2, 1])
+    )
+    assert report["queries_with_top10_raw_score_tie"] == 1
+    assert report["ties_crossing_rank10_boundary"] == 0
+
+
+def test_raw_score_tie_crosses_rank10_boundary() -> None:
+    report = raw_score_tie_statistics(
+        _raw_tie_frame([12, 11, 10, 9, 8, 7, 6, 5, 4, 1, 1, 0])
+    )
+    assert report["raw_score_tie_groups"] == 1
+    assert report["queries_with_top10_raw_score_tie"] == 0
+    assert report["ties_crossing_rank10_boundary"] == 1
+
+
+def test_raw_score_ties_absent() -> None:
+    report = raw_score_tie_statistics(
+        _raw_tie_frame([12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+    )
+    assert report["raw_score_tie_groups"] == 0
+    assert report["rows_in_raw_score_ties"] == 0
+    assert report["largest_raw_score_tie_group"] == 0
 
 
 def test_recall_invariant_is_exact_key_set_equality() -> None:

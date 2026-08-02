@@ -95,8 +95,8 @@ def _write_fake_trec_eval(path: Path) -> None:
         """#!/usr/bin/env python3
 import math, sys
 args = sys.argv[1:]
-if '-h' in args:
-    print('trec_eval fixture compatible with v9.0.8')
+if '-v' in args:
+    print('trec_eval 9.0.8')
     raise SystemExit(0)
 metric = args[args.index('-m') + 1]
 per_query = '-q' in args
@@ -441,11 +441,50 @@ def test_full_fixture_pipeline_resume_evaluation_package_and_idempotence(
     assert [entry["depth"] for entry in depth_profile["depths"]] == [10, 20, 50, 100]
     assert all(entry["candidate_set_invariant"] for entry in depth_profile["depths"])
     assert depth_profile["depths"][-1]["official"] is True
+    system_metrics = json.loads(
+        (tmp_path / "reports/metrics/dev_zeroshot_mminilmv2l12.json").read_text()
+    )
+    for field in (
+        "raw_score_tie_definition",
+        "raw_score_tie_groups",
+        "rows_in_raw_score_ties",
+        "queries_with_any_raw_score_tie",
+        "queries_with_top10_raw_score_tie",
+        "ties_crossing_rank10_boundary",
+        "largest_raw_score_tie_group",
+        "scoring_source_sha256",
+        "evaluation_source_sha256",
+    ):
+        assert field in system_metrics
+    version_probe = system_metrics["trec_eval"]["version_probe"]
+    assert version_probe["command"][-1] == "-v"
+    assert version_probe["parsed_version"] == "9.0.8"
+    assert version_probe["version_matches_expected"] is True
+    baseline_metrics = json.loads(
+        (tmp_path / "reports/metrics/dev_bm25_baseline.json").read_text()
+    )
+    assert baseline_metrics["python_cross_check"]["tie_break"]["conclusion"] == (
+        "inconclusive_metric_equivalent"
+    )
+    strata = json.loads(
+        (tmp_path / "reports/metrics/dev_zeroshot_vs_bm25.json").read_text()
+    )["stratified_mean_delta"]
+    assert strata["invariants"]["each_query_in_exactly_one_stratum"] is True
+    assert strata["invariants"]["stratum_query_count_sum"] == 2
     manifest_path = tmp_path / "reports/audit/rerank_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["status"] == "PASS"
     assert all(entry["path"] != "reports/audit/rerank_manifest.json" for entry in manifest["files"])
     assert "manifest_sha256" not in manifest
+    assert all(
+        entry["scoring_source_sha256"]
+        and entry["evaluation_source_sha256"]
+        and "raw_score_tie_definition" in entry
+        and "score_producer_commit" in entry
+        and "evaluation_commit" in entry
+        and "package_commit" in entry
+        for entry in manifest["files"]
+    )
     protocol = tmp_path / "reports/audit/rerank_protocol.yaml"
     assert protocol.read_bytes() == config_path.read_bytes()
     archive_path = tmp_path / "artifacts/rusearchrank_phase2_results.zip"
@@ -550,7 +589,14 @@ def test_stale_final_fingerprint_requires_overwrite_and_preserves_bytes(
     scores = tmp_path / "artifacts/scores/dev_zeroshot_mminilmv2l12.parquet"
     before = scores.read_bytes()
     source = tmp_path / "src/rusearchrank/rerank.py"
-    source.write_bytes(source.read_bytes() + b"\n# fixture source change\n")
+    original_source = source.read_text(encoding="utf-8")
+    changed_source = original_source.replace(
+        'return f"{title}{separator}{text}" if title and title.strip() else text',
+        'return (f"{title}{separator}{text}" if title and title.strip() else text)',
+        1,
+    )
+    assert changed_source != original_source
+    source.write_text(changed_source, encoding="utf-8")
     with pytest.raises(ValueError, match="stale or invalid"):
         rerank.run_rerank_scoring(
             config, split="dev", requested_device="cpu", scorer=StubScorer()
@@ -627,7 +673,7 @@ def test_cli_smoke_gate_rejects_missing_fixture_and_stale_reports(
     with pytest.raises(cli_module.StageError, match="fixture-only"):
         cli_module._rerank_score(_score_args(config_path), scorer=StubScorer())
     report["fixture_only"] = False
-    report["source_tree_sha256"] = "0" * 64
+    report["scoring_source_sha256"] = "0" * 64
     rerank.atomic_write_json(smoke_path, report)
     with pytest.raises(cli_module.StageError, match="stale or incompatible"):
         cli_module._rerank_score(_score_args(config_path), scorer=StubScorer())
@@ -635,7 +681,12 @@ def test_cli_smoke_gate_rejects_missing_fixture_and_stale_reports(
 
 @pytest.mark.parametrize(
     "field",
-    ["config_sha256", "source_tree_sha256", "candidates_sha256", "model_revision"],
+    [
+        "scoring_source_sha256",
+        "scoring_config_sha256",
+        "candidates_sha256",
+        "model_revision",
+    ],
 )
 def test_cli_smoke_gate_rejects_each_load_bearing_mismatch(
     tmp_path: Path, field: str
@@ -649,6 +700,19 @@ def test_cli_smoke_gate_rejects_each_load_bearing_mismatch(
         cli_module._rerank_score(_score_args(config_path), scorer=StubScorer())
 
 
+def test_cli_smoke_gate_allows_evaluation_only_hash_change(tmp_path: Path) -> None:
+    config_path, _ = build_fixture(tmp_path)
+    smoke_path = tmp_path / "reports/audit/rerank_smoke.json"
+    report = json.loads(smoke_path.read_text())
+    report["evaluation_source_sha256"] = "0" * 64
+    report["source_tree_sha256"] = "0" * 64
+    report["config_sha256"] = "0" * 64
+    rerank.atomic_write_json(smoke_path, report)
+    assert cli_module._rerank_score(
+        _score_args(config_path), scorer=StubScorer()
+    ) == 0
+
+
 def test_valid_real_pass_smoke_unlocks_cli_scoring(tmp_path: Path) -> None:
     config_path, _ = build_fixture(tmp_path)
     assert cli_module._rerank_score(_score_args(config_path), scorer=StubScorer()) == 0
@@ -657,7 +721,134 @@ def test_valid_real_pass_smoke_unlocks_cli_scoring(tmp_path: Path) -> None:
     ).is_file()
 
 
-def test_source_tree_change_rejects_old_partial_shard(
+def test_evaluation_source_change_preserves_existing_score(tmp_path: Path) -> None:
+    config_path, _ = build_fixture(tmp_path)
+    config = rerank.load_rerank_config(config_path)
+    rerank.run_rerank_scoring(
+        config, split="dev", requested_device="cpu", scorer=StubScorer()
+    )
+    score_path = tmp_path / "artifacts/scores/dev_zeroshot_mminilmv2l12.parquet"
+    before = score_path.read_bytes()
+    old_sidecar = json.loads(
+        score_path.with_name(f"{score_path.name}.json").read_text()
+    )
+    source = tmp_path / "src/rusearchrank/evaluation.py"
+    source.write_bytes(source.read_bytes() + b"\n# evaluation-only audit patch\n")
+    validated = rerank.validate_current_score_sidecar(config, score_path=score_path)
+    assert (
+        validated["scoring_source_sha256"]
+        == old_sidecar["fingerprint_components"]["scoring_source_sha256"]
+    )
+    assert (
+        validated["evaluation_source_sha256"]
+        != old_sidecar["fingerprint_components"]["evaluation_source_sha256"]
+    )
+    reused = rerank.run_rerank_scoring(
+        config, split="dev", requested_device="cpu", scorer=StubScorer()
+    )
+    assert reused["action"] == "reused_valid_scores"
+    assert score_path.read_bytes() == before
+
+
+def test_legacy_production_sidecar_is_reused_after_evaluation_only_patch(
+    tmp_path: Path,
+) -> None:
+    config_path, _ = build_fixture(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "fixture@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Fixture"], cwd=tmp_path, check=True
+    )
+    tracked = [
+        "configs/rerank.yaml",
+        "pyproject.toml",
+        "src/rusearchrank/rerank.py",
+        "src/rusearchrank/cli.py",
+        "src/rusearchrank/evaluation.py",
+    ]
+    subprocess.run(["git", "add", *tracked], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture producer"],
+        cwd=tmp_path,
+        check=True,
+    )
+    config = rerank.load_rerank_config(config_path)
+    rerank.run_rerank_scoring(
+        config, split="dev", requested_device="cpu", scorer=StubScorer()
+    )
+    score_path = tmp_path / "artifacts/scores/dev_zeroshot_mminilmv2l12.parquet"
+    sidecar_path = score_path.with_name(f"{score_path.name}.json")
+    sidecar = json.loads(sidecar_path.read_text())
+    components = dict(sidecar["fingerprint_components"])
+    components.pop("scoring_source_sha256")
+    components.pop("scoring_config_sha256")
+    components.pop("evaluation_source_sha256")
+    sidecar["fingerprint_components"] = components
+    sidecar["input_fingerprint"] = rerank.build_legacy_input_fingerprint(
+        components
+    )
+    rerank.atomic_write_json(sidecar_path, sidecar)
+
+    evaluation_source = tmp_path / "src/rusearchrank/evaluation.py"
+    evaluation_source.write_bytes(
+        evaluation_source.read_bytes() + b"\n# post-production evaluation patch\n"
+    )
+    validated = rerank.validate_current_score_sidecar(config, score_path=score_path)
+    assert validated["provenance_migration"]["mode"] == (
+        "verified_legacy_git_source"
+    )
+    assert (
+        validated["scoring_source_sha256"]
+        == validated["provenance_migration"][
+            "producer_scoring_source_sha256"
+        ]
+    )
+
+
+@pytest.mark.parametrize("damage", ["file_hash", "schema", "key_set"])
+def test_downstream_rejects_damaged_existing_score(
+    tmp_path: Path, damage: str
+) -> None:
+    config_path, _ = build_fixture(tmp_path)
+    config = rerank.load_rerank_config(config_path)
+    rerank.run_rerank_scoring(
+        config, split="dev", requested_device="cpu", scorer=StubScorer()
+    )
+    score_path = tmp_path / "artifacts/scores/dev_zeroshot_mminilmv2l12.parquet"
+    sidecar_path = score_path.with_name(f"{score_path.name}.json")
+    if damage == "file_hash":
+        data = bytearray(score_path.read_bytes())
+        data[-12] ^= 1
+        score_path.write_bytes(data)
+    else:
+        table = pq.read_table(score_path)
+        if damage == "schema":
+            columns = [
+                table.column(name).cast(pa.float64())
+                if name == "score"
+                else table.column(name)
+                for name in table.column_names
+            ]
+            table = pa.Table.from_arrays(columns, names=table.column_names)
+        else:
+            rows = table.to_pylist()
+            rows[0]["docid"] = "unexpected-docid"
+            table = pa.Table.from_pylist(rows, schema=rerank.SCORE_SCHEMA)
+        pq.write_table(table, score_path)
+        sidecar = json.loads(sidecar_path.read_text())
+        digest = hashlib.sha256(score_path.read_bytes()).hexdigest()
+        sidecar["scores_sha256"] = digest
+        sidecar["shard_sha256"] = digest
+        rerank.atomic_write_json(sidecar_path, sidecar)
+    with pytest.raises((ValueError, OSError, pa.ArrowInvalid)):
+        rerank.validate_current_score_sidecar(config, score_path=score_path)
+
+
+def test_scoring_source_change_rejects_old_partial_shard(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path, _ = build_fixture(tmp_path)
@@ -669,8 +860,15 @@ def test_source_tree_change_rejects_old_partial_shard(
             requested_device="cpu",
             scorer=StubScorer(fail_on_call=2),
         )
-    source = tmp_path / "src/rusearchrank/evaluation.py"
-    source.write_bytes(source.read_bytes() + b"\n# changed load-bearing byte\n")
+    source = tmp_path / "src/rusearchrank/rerank.py"
+    original_source = source.read_text(encoding="utf-8")
+    changed_source = original_source.replace(
+        'return f"{title}{separator}{text}" if title and title.strip() else text',
+        'return (f"{title}{separator}{text}" if title and title.strip() else text)',
+        1,
+    )
+    assert changed_source != original_source
+    source.write_text(changed_source, encoding="utf-8")
     result = rerank.run_rerank_scoring(
         config,
         split="dev",
@@ -680,6 +878,23 @@ def test_source_tree_change_rejects_old_partial_shard(
     assert result["reused_shards"] == 0
     assert result["scored_shards"] == 2
     assert "input_fingerprint is stale" in capsys.readouterr().out
+
+
+def test_scoring_config_change_rejects_existing_score(tmp_path: Path) -> None:
+    config_path, _ = build_fixture(tmp_path)
+    config = rerank.load_rerank_config(config_path)
+    rerank.run_rerank_scoring(
+        config, split="dev", requested_device="cpu", scorer=StubScorer()
+    )
+    changed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    changed["inference"]["seed"] += 1
+    config_path.write_text(
+        yaml.safe_dump(changed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    changed_config = rerank.load_rerank_config(config_path)
+    with pytest.raises(ValueError, match="scoring_config_sha256"):
+        rerank.validate_current_score_sidecar(changed_config)
 
 
 def test_preflight_reports_unavailable_pinned_model_clearly(tmp_path: Path) -> None:
