@@ -10,6 +10,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -255,6 +256,7 @@ class StageError(RuntimeError):
         root_cause: str,
         reusable: str,
         repeat_cell: str,
+        rollback_status: str | None = None,
     ) -> None:
         self.stage = stage
         payload = {
@@ -266,6 +268,8 @@ class StageError(RuntimeError):
             "safe_to_reuse": reusable,
             "repeat_cell": repeat_cell,
         }
+        if rollback_status is not None:
+            payload["rollback_status"] = rollback_status
         super().__init__(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -3167,7 +3171,7 @@ def _execute_rerank_trec_eval(
     *,
     run_path: Path,
     executable: Path,
-    version_probe: dict[str, Any],
+    trec_eval_provenance: dict[str, Any],
 ) -> dict[str, Any]:
     qrels_path = rerank_module.resolve_path(config, config["inputs"]["qrels"])
     executions: dict[str, Any] = {}
@@ -3186,9 +3190,20 @@ def _execute_rerank_trec_eval(
             executable,
             [*[str(value) for value in arguments], str(qrels_path), str(run_path)],
         )
+        execution["command"] = [
+            str(executable),
+            *[str(value) for value in arguments],
+            rerank_module.portable_path(config, qrels_path),
+            rerank_module.portable_path(config, run_path),
+        ]
         execution["executable"] = str(executable)
-        execution["expected_version"] = str(config["evaluation"]["trec_eval_version"])
-        execution["version_probe"] = version_probe
+        execution["expected_release_version"] = str(
+            config["evaluation"]["trec_eval_expected_release"]
+        )
+        execution["binary_reported_version"] = trec_eval_provenance[
+            "binary_reported_version"
+        ]
+        execution["version_probe"] = trec_eval_provenance["version_probe"]
         executions[name] = execution
         if name == "per_query_ndcg_at_10":
             parsed[name] = parse_trec_eval_per_query(str(execution["stdout"]), metric)
@@ -3197,8 +3212,14 @@ def _execute_rerank_trec_eval(
         execution["parsed"] = parsed[name]
     return {
         "executable": str(executable),
-        "expected_version": str(config["evaluation"]["trec_eval_version"]),
-        "version_probe": version_probe,
+        "expected_release_version": str(
+            config["evaluation"]["trec_eval_expected_release"]
+        ),
+        "binary_reported_version": trec_eval_provenance[
+            "binary_reported_version"
+        ],
+        "version_probe": trec_eval_provenance["version_probe"],
+        "build_provenance": trec_eval_provenance,
         "run": _rerank_file_metadata(config, run_path),
         "executions": executions,
         "parsed": parsed,
@@ -3296,6 +3317,191 @@ def _metric_common_provenance(
     }
 
 
+_EVALUATION_REPORT_ORDER = (
+    "baseline",
+    "system",
+    "comparison",
+    "depth_profile",
+)
+
+
+def _validate_evaluation_generation(
+    reports: dict[str, dict[str, Any]],
+    *,
+    evaluation_fingerprint: str,
+    staging_directory: Path,
+) -> None:
+    if tuple(reports) != _EVALUATION_REPORT_ORDER:
+        raise ValueError("evaluation generation does not contain the exact four reports")
+    serialized = json.dumps(reports, ensure_ascii=False, sort_keys=True)
+    if str(staging_directory) in serialized or ".tmp." in serialized:
+        raise ValueError("evaluation reports contain temporary paths")
+
+    def reject_unapproved_absolute_paths(value: Any, *, key: str = "") -> None:
+        if isinstance(value, dict):
+            for nested_key, nested in value.items():
+                reject_unapproved_absolute_paths(nested, key=str(nested_key))
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                if (
+                    key == "command"
+                    and index == 0
+                    and isinstance(nested, str)
+                    and Path(nested).is_absolute()
+                ):
+                    continue
+                reject_unapproved_absolute_paths(nested, key=key)
+        elif (
+            isinstance(value, str)
+            and Path(value).is_absolute()
+            and key not in {"binary_path", "source_path", "executable"}
+        ):
+            raise ValueError(
+                f"evaluation reports contain an unapproved absolute path at {key}: {value}"
+            )
+
+    reject_unapproved_absolute_paths(reports)
+    provenances: list[dict[str, Any]] = []
+    input_artifacts: list[dict[str, Any]] = []
+    for name, report in reports.items():
+        if report.get("status") != "PASS":
+            raise ValueError(f"temporary {name} report status is not PASS")
+        if report.get("evaluation_fingerprint") != evaluation_fingerprint:
+            raise ValueError(f"temporary {name} report has a different fingerprint")
+        provenance = report.get("trec_eval_provenance")
+        if not isinstance(provenance, dict) or provenance.get(
+            "evaluation_protocol_status"
+        ) != "PASS":
+            raise ValueError(f"temporary {name} report lacks valid trec_eval provenance")
+        provenances.append(provenance)
+        artifacts = report.get("input_artifacts")
+        if not isinstance(artifacts, dict) or not artifacts:
+            raise ValueError(f"temporary {name} report lacks input artifact hashes")
+        input_artifacts.append(artifacts)
+    if any(value != provenances[0] for value in provenances[1:]):
+        raise ValueError("temporary reports disagree on trec_eval provenance")
+    if any(value != input_artifacts[0] for value in input_artifacts[1:]):
+        raise ValueError("temporary reports disagree on model/input hashes")
+
+    baseline_value = float(reports["baseline"]["official"]["value"])
+    system_value = float(reports["system"]["official"]["value"])
+    official_depths = [
+        entry
+        for entry in reports["depth_profile"].get("depths", [])
+        if entry.get("official") is True
+    ]
+    if len(official_depths) != 1 or not math.isclose(
+        float(official_depths[0]["ndcg_at_10"]), system_value, abs_tol=1e-12
+    ):
+        raise ValueError("system and official depth-profile metrics disagree")
+    paired_delta = float(reports["comparison"]["paired"]["mean_delta"])
+    if not math.isclose(system_value - baseline_value, paired_delta, abs_tol=1e-4):
+        raise ValueError("baseline/system/comparison metrics are inconsistent")
+    strata = reports["comparison"].get("stratified_mean_delta")
+    if not isinstance(strata, dict):
+        raise ValueError("comparison report is missing strata")
+    invariants = strata.get("invariants")
+    if not isinstance(invariants, dict) or invariants.get(
+        "each_query_in_exactly_one_stratum"
+    ) is not True:
+        raise ValueError("comparison strata are not a disjoint complete partition")
+
+
+def _stage_evaluation_generation(
+    reports: dict[str, dict[str, Any]],
+    *,
+    staging_directory: Path,
+    evaluation_fingerprint: str,
+) -> dict[str, Path]:
+    staged_paths: dict[str, Path] = {}
+    for name in _EVALUATION_REPORT_ORDER:
+        path = staging_directory / f"{name}.json"
+        _write_json(path, reports[name])
+        staged_paths[name] = path
+    loaded = {name: _read_json(path) for name, path in staged_paths.items()}
+    _validate_evaluation_generation(
+        loaded,
+        evaluation_fingerprint=evaluation_fingerprint,
+        staging_directory=staging_directory,
+    )
+    return staged_paths
+
+
+def _publish_evaluation_generation(
+    *,
+    config: dict[str, Any],
+    output_paths: dict[str, Path],
+    staged_paths: dict[str, Path],
+    replace: Any | None = None,
+) -> dict[str, Any]:
+    if tuple(output_paths) != _EVALUATION_REPORT_ORDER or tuple(staged_paths) != (
+        _EVALUATION_REPORT_ORDER
+    ):
+        raise ValueError("evaluation publication requires the exact ordered generation")
+    work_dir = rerank_module.resolve_path(config, config["paths"]["work_dir"])
+    backup_dir = work_dir / (
+        "metrics-backup-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    )
+    existing = {name: path.is_file() for name, path in output_paths.items()}
+    replace_path = replace or os.replace
+    moved_old: list[str] = []
+    published_new: list[str] = []
+    try:
+        if any(existing.values()):
+            backup_dir.mkdir(parents=True, exist_ok=False)
+            for name in _EVALUATION_REPORT_ORDER:
+                if existing[name]:
+                    replace_path(output_paths[name], backup_dir / output_paths[name].name)
+                    moved_old.append(name)
+        for name in _EVALUATION_REPORT_ORDER:
+            output_paths[name].parent.mkdir(parents=True, exist_ok=True)
+            replace_path(staged_paths[name], output_paths[name])
+            published_new.append(name)
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for name in reversed(published_new):
+            try:
+                replace_path(output_paths[name], staged_paths[name])
+            except Exception as rollback_exc:
+                rollback_errors.append(f"remove_new:{name}:{rollback_exc}")
+        for name in reversed(moved_old):
+            try:
+                replace_path(backup_dir / output_paths[name].name, output_paths[name])
+            except Exception as rollback_exc:
+                rollback_errors.append(f"restore_old:{name}:{rollback_exc}")
+        rollback_status = "PASS" if not rollback_errors else (
+            "FAIL: " + "; ".join(rollback_errors)
+        )
+        raise StageError(
+            stage="evaluate-rerank/publication",
+            command=(
+                "python -m rusearchrank.cli evaluate-rerank "
+                "--config configs/rerank.yaml --split dev --overwrite"
+            ),
+            inputs={
+                "previous_generation": str(backup_dir),
+                "temporary_generation": str(next(iter(staged_paths.values())).parent),
+            },
+            outputs={name: str(path) for name, path in output_paths.items()},
+            root_cause=f"publication failed after {published_new}: {exc}",
+            reusable=(
+                "production metrics are restored and score-Parquet/TREC runs remain reusable"
+                if not rollback_errors
+                else "manual recovery is required from the listed backup generation"
+            ),
+            repeat_cell="Cell 12: repeat evaluate-rerank only after reviewing rollback_status",
+            rollback_status=rollback_status,
+        ) from exc
+    return {
+        "rollback_status": "NOT_NEEDED",
+        "previous_generation": (
+            rerank_module.portable_path(config, backup_dir)
+            if any(existing.values())
+            else None
+        ),
+    }
+
+
 def _smoke_rerank(args: argparse.Namespace) -> int:
     config = rerank_module.load_rerank_config(args.config)
     report = rerank_module.run_smoke_rerank(
@@ -3370,17 +3576,12 @@ def _build_rerank_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _evaluate_rerank(args: argparse.Namespace) -> int:
-    config = rerank_module.load_rerank_config(args.config)
-    if args.split != "dev":
-        raise ValueError("Phase 2 evaluation only supports dev")
+def _rerank_evaluation_preflight(config: dict[str, Any]) -> dict[str, Any]:
     rerank_module.validate_phase1_inputs(config)
     score_path = rerank_module.resolve_path(config, config["artifacts"]["scores"])
-    score_sidecar_path = score_path.with_name(f"{score_path.name}.json")
     score_sidecar = rerank_module.validate_current_score_sidecar(
         config, score_path=score_path
     )
-
     official_depth = int(config["protocol"]["official_depth"])
     depths = [
         *[int(value) for value in config["protocol"]["diagnostic_depths"]],
@@ -3392,6 +3593,31 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
     bm25_path = rerank_module.resolve_path(config, config["inputs"]["bm25_run"])
     qrels_path = rerank_module.resolve_path(config, config["inputs"]["qrels"])
     candidates_path = rerank_module.resolve_path(config, config["inputs"]["candidates"])
+    for label, path in (
+        ("BM25 run", bm25_path),
+        ("qrels", qrels_path),
+        ("candidate cache", candidates_path),
+    ):
+        _require_nonempty_regular_file(path, label=label)
+
+    executable = rerank_module.resolve_trec_eval(config)
+    trec_eval_provenance = rerank_module.validate_trec_eval_build_provenance(
+        config, executable=executable
+    )
+    qrels = load_qrels(qrels_path, split="dev")
+    query_ids = list(dict.fromkeys(qrels["query_id"].astype("string").map(str)))
+    candidates = pd.read_parquet(candidates_path)
+    candidates = candidates.loc[candidates["split"].astype("string").eq("dev")].copy()
+    bm25_run = read_trec_run(str(bm25_path), split="dev")
+    candidate_invariant = assert_candidate_set_invariant(candidates, bm25_run)
+    rerank_runs = {
+        depth: read_trec_run(str(path), split="dev")
+        for depth, path in run_paths.items()
+    }
+    for run in rerank_runs.values():
+        assert_candidate_set_invariant(candidates, run)
+        assert_candidate_set_invariant(bm25_run, run)
+
     current_hashes = {
         "config": _sha256(Path(str(config["_config_path"]))),
         "evaluation_source": rerank_module.evaluation_source_sha256(config)[0],
@@ -3404,9 +3630,91 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
     }
     evaluation_fingerprint = rerank_module.canonical_json_sha256(current_hashes)
     output_paths = {
-        name: rerank_module.resolve_path(config, value)
-        for name, value in config["metrics"].items()
+        name: rerank_module.resolve_path(config, config["metrics"][name])
+        for name in _EVALUATION_REPORT_ORDER
     }
+    work_dir = rerank_module.resolve_path(config, config["paths"]["work_dir"])
+    work_dir.mkdir(parents=True, exist_ok=True)
+    staging_directory = Path(
+        tempfile.mkdtemp(prefix="evaluation-generation-", dir=work_dir)
+    )
+    return {
+        "score_path": score_path,
+        "score_sidecar": score_sidecar,
+        "official_depth": official_depth,
+        "depths": depths,
+        "run_paths": run_paths,
+        "bm25_path": bm25_path,
+        "qrels_path": qrels_path,
+        "candidates_path": candidates_path,
+        "executable": executable,
+        "trec_eval_provenance": trec_eval_provenance,
+        "qrels": qrels,
+        "query_ids": query_ids,
+        "candidates": candidates,
+        "bm25_run": bm25_run,
+        "candidate_invariant": candidate_invariant,
+        "rerank_runs": rerank_runs,
+        "evaluation_fingerprint": evaluation_fingerprint,
+        "output_paths": output_paths,
+        "staging_directory": staging_directory,
+    }
+
+
+def _evaluate_rerank_impl(args: argparse.Namespace) -> int:
+    config = rerank_module.load_rerank_config(args.config)
+    if args.split != "dev":
+        raise ValueError("Phase 2 evaluation only supports dev")
+    try:
+        preflight = _rerank_evaluation_preflight(config)
+    except Exception as exc:
+        output_paths = {
+            name: rerank_module.resolve_path(config, config["metrics"][name])
+            for name in _EVALUATION_REPORT_ORDER
+        }
+        raise StageError(
+            stage="evaluate-rerank/preflight",
+            command=(
+                "python -m rusearchrank.cli evaluate-rerank "
+                "--config configs/rerank.yaml --split dev --overwrite"
+            ),
+            inputs={
+                "config": str(config["_config_path"]),
+                "trec_eval_provenance": str(
+                    rerank_module.resolve_path(
+                        config, config["evaluation"]["trec_eval_provenance_path"]
+                    )
+                ),
+            },
+            outputs={name: str(path) for name, path in output_paths.items()},
+            root_cause=str(exc),
+            reusable=(
+                "all existing production metrics, score-Parquet, and TREC runs "
+                "are byte-for-byte untouched"
+            ),
+            repeat_cell="Cell 12: fix the named preflight input, then repeat evaluate-rerank",
+            rollback_status="NOT_STARTED",
+        ) from exc
+    score_path = preflight["score_path"]
+    score_sidecar = preflight["score_sidecar"]
+    official_depth = preflight["official_depth"]
+    depths = preflight["depths"]
+    run_paths = preflight["run_paths"]
+    bm25_path = preflight["bm25_path"]
+    qrels_path = preflight["qrels_path"]
+    candidates_path = preflight["candidates_path"]
+    executable = preflight["executable"]
+    trec_eval_provenance = preflight["trec_eval_provenance"]
+    qrels = preflight["qrels"]
+    query_ids = preflight["query_ids"]
+    candidates = preflight["candidates"]
+    bm25_run = preflight["bm25_run"]
+    candidate_invariant = preflight["candidate_invariant"]
+    rerank_runs = preflight["rerank_runs"]
+    evaluation_fingerprint = preflight["evaluation_fingerprint"]
+    output_paths = preflight["output_paths"]
+    staging_directory = preflight["staging_directory"]
+    setattr(args, "_evaluation_staging_directory", str(staging_directory))
     existing = {name: path.exists() for name, path in output_paths.items()}
     if all(existing.values()) and not args.overwrite:
         reports = {name: _read_json(path) for name, path in output_paths.items()}
@@ -3436,45 +3744,21 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             f"partial evaluation output detected and preserved: {existing}; "
             "use --overwrite after review"
         )
-    if args.overwrite:
-        for path in output_paths.values():
-            rerank_module.preserve_stale(path)
-
-    executable = rerank_module.resolve_trec_eval(config)
-    version_probe = rerank_module.probe_trec_eval(
-        executable,
-        expected_version=str(config["evaluation"]["trec_eval_version"]),
-    )
-    rerank_module.require_trec_eval_version(version_probe)
     baseline_trec = _execute_rerank_trec_eval(
         config,
         run_path=bm25_path,
         executable=executable,
-        version_probe=version_probe,
+        trec_eval_provenance=trec_eval_provenance,
     )
     depth_trec = {
         depth: _execute_rerank_trec_eval(
             config,
             run_path=path,
             executable=executable,
-            version_probe=version_probe,
+            trec_eval_provenance=trec_eval_provenance,
         )
         for depth, path in run_paths.items()
     }
-
-    qrels = load_qrels(qrels_path, split="dev")
-    query_ids = list(dict.fromkeys(qrels["query_id"].astype("string").map(str)))
-    candidates = pd.read_parquet(candidates_path)
-    candidates = candidates.loc[candidates["split"].astype("string").eq("dev")].copy()
-    bm25_run = read_trec_run(str(bm25_path), split="dev")
-    candidate_invariant = assert_candidate_set_invariant(candidates, bm25_run)
-    rerank_runs = {
-        depth: read_trec_run(str(path), split="dev")
-        for depth, path in run_paths.items()
-    }
-    for depth, run in rerank_runs.items():
-        assert_candidate_set_invariant(candidates, run)
-        assert_candidate_set_invariant(bm25_run, run)
 
     tolerance = float(config["evaluation"]["python_vs_trec_eval_tolerance"])
     baseline_vector = baseline_trec["parsed"]["per_query_ndcg_at_10"]
@@ -3653,7 +3937,12 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             "metric": "standard_nDCG@10",
             "value": float(baseline_trec["parsed"]["ndcg_at_10"]),
             "tool": "NIST trec_eval",
-            "version": str(config["evaluation"]["trec_eval_version"]),
+            "expected_release_version": str(
+                config["evaluation"]["trec_eval_expected_release"]
+            ),
+            "binary_reported_version": trec_eval_provenance[
+                "binary_reported_version"
+            ],
         },
         "diagnostic": {
             "diagnostic": True,
@@ -3662,6 +3951,7 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             "sparse_judgments": baseline_sparse,
         },
         "trec_eval": baseline_trec,
+        "trec_eval_provenance": trec_eval_provenance,
         "python_cross_check": {
             "ndcg_at_10": float(baseline_python["aggregate"]["ndcg_at_10"]),
             "absolute_difference": aggregate_baseline_difference,
@@ -3690,7 +3980,12 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             "metric": "standard_nDCG@10",
             "value": float(official_trec["parsed"]["ndcg_at_10"]),
             "tool": "NIST trec_eval",
-            "version": str(config["evaluation"]["trec_eval_version"]),
+            "expected_release_version": str(
+                config["evaluation"]["trec_eval_expected_release"]
+            ),
+            "binary_reported_version": trec_eval_provenance[
+                "binary_reported_version"
+            ],
             "depth": official_depth,
         },
         "diagnostic": {
@@ -3700,6 +3995,7 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             "sparse_judgments": official_sparse,
         },
         "trec_eval": official_trec,
+        "trec_eval_provenance": trec_eval_provenance,
         "python_cross_check": {
             "ndcg_at_10": float(
                 python_by_depth[official_depth]["aggregate"]["ndcg_at_10"]
@@ -3715,6 +4011,7 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
     }
     comparison_payload = {
         "status": "PASS",
+        "trec_eval_provenance": trec_eval_provenance,
         "official_metric": "standard_nDCG@10",
         "paired": official_comparison,
         "recall_at_100_invariant": {
@@ -3761,14 +4058,59 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         )
     depth_payload = {
         "status": "PASS",
+        "trec_eval_provenance": trec_eval_provenance,
         "baseline_sha256": _sha256(bm25_path),
         "depths": depth_entries,
         **system_common,
     }
-    _write_json(output_paths["baseline"], baseline_payload)
-    _write_json(output_paths["system"], system_payload)
-    _write_json(output_paths["comparison"], comparison_payload)
-    _write_json(output_paths["depth_profile"], depth_payload)
+    reports = {
+        "baseline": baseline_payload,
+        "system": system_payload,
+        "comparison": comparison_payload,
+        "depth_profile": depth_payload,
+    }
+    try:
+        staged_paths = _stage_evaluation_generation(
+            reports,
+            staging_directory=staging_directory,
+            evaluation_fingerprint=evaluation_fingerprint,
+        )
+    except Exception as exc:
+        raise StageError(
+            stage="evaluate-rerank/temporary-calculation-validation",
+            command=(
+                "python -m rusearchrank.cli evaluate-rerank "
+                "--config configs/rerank.yaml --split dev --overwrite"
+            ),
+            inputs={
+                "score_parquet": str(score_path),
+                "trec_eval_provenance": str(
+                    rerank_module.resolve_path(
+                        config, config["evaluation"]["trec_eval_provenance_path"]
+                    )
+                ),
+            },
+            outputs={
+                "temporary_generation": str(staging_directory),
+                **{name: str(path) for name, path in output_paths.items()},
+            },
+            root_cause=str(exc),
+            reusable=(
+                "all existing production metrics, score-Parquet, and TREC runs "
+                "are byte-for-byte untouched"
+            ),
+            repeat_cell="Cell 12: inspect the temporary generation, then repeat evaluation",
+            rollback_status="NOT_STARTED",
+        ) from exc
+    publication = _publish_evaluation_generation(
+        config=config,
+        output_paths=output_paths,
+        staged_paths=staged_paths,
+    )
+    try:
+        staging_directory.rmdir()
+    except OSError:
+        pass
     _print_json(
         {
             "status": "PASS",
@@ -3778,6 +4120,8 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
             "mean_delta": official_comparison["mean_delta"],
             "pooling_bias_suspected": pooling_bias_suspected,
             "evaluation_fingerprint": evaluation_fingerprint,
+            "trec_eval_provenance": trec_eval_provenance,
+            "publication": publication,
             "outputs": {
                 name: rerank_module.portable_path(config, path)
                 for name, path in output_paths.items()
@@ -3785,6 +4129,45 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
         }
     )
     return 0
+
+
+def _evaluate_rerank(args: argparse.Namespace) -> int:
+    try:
+        return _evaluate_rerank_impl(args)
+    except StageError:
+        raise
+    except Exception as exc:
+        config = rerank_module.load_rerank_config(args.config)
+        output_paths = {
+            name: rerank_module.resolve_path(config, config["metrics"][name])
+            for name in _EVALUATION_REPORT_ORDER
+        }
+        temporary = str(
+            getattr(
+                args,
+                "_evaluation_staging_directory",
+                rerank_module.resolve_path(config, config["paths"]["work_dir"]),
+            )
+        )
+        raise StageError(
+            stage="evaluate-rerank/calculation-validation",
+            command=(
+                "python -m rusearchrank.cli evaluate-rerank "
+                "--config configs/rerank.yaml --split dev --overwrite"
+            ),
+            inputs={
+                "config": str(config["_config_path"]),
+                "temporary_generation": temporary,
+            },
+            outputs={name: str(path) for name, path in output_paths.items()},
+            root_cause=str(exc),
+            reusable=(
+                "all existing production metrics, score-Parquet, and TREC runs "
+                "are byte-for-byte untouched"
+            ),
+            repeat_cell="Cell 12: inspect the temporary generation, then repeat evaluation",
+            rollback_status="NOT_STARTED",
+        ) from exc
 
 
 def _package_phase2(args: argparse.Namespace) -> int:

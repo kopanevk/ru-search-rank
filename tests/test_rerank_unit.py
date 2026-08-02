@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -31,10 +32,12 @@ from rusearchrank.rerank import (
     probe_trec_eval,
     render_rank_preserving_trec,
     require_trec_eval_version,
+    scoring_config_sha256,
     scoring_source_sha256,
     score_schema_json,
     source_tree_sha256,
     token_accounting,
+    validate_trec_eval_build_provenance,
     validate_rank_preserving_trec,
     validate_score_table,
 )
@@ -318,6 +321,17 @@ def test_evaluation_only_provenance_does_not_change_score_fingerprint(
     assert build_input_fingerprint(base) == build_input_fingerprint(changed)
 
 
+def test_trec_eval_evaluation_config_does_not_change_scoring_hashes() -> None:
+    config = load_rerank_config()
+    before_source = scoring_source_sha256(config)[0]
+    before_config = scoring_config_sha256(config)
+    changed = copy.deepcopy(config)
+    changed["evaluation"]["trec_eval_expected_reported_version"] = "9.0.6"
+    changed["evaluation"]["trec_eval_provenance_path"] = "other/provenance.json"
+    assert scoring_source_sha256(changed)[0] == before_source
+    assert scoring_config_sha256(changed) == before_config
+
+
 def test_source_tree_hash_changes_when_any_source_byte_changes(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("a", encoding="utf-8")
     (tmp_path / "b.py").write_text("b", encoding="utf-8")
@@ -455,30 +469,30 @@ def _version_probe_script(
     return path
 
 
-def test_trec_eval_version_probe_accepts_9_0_8(tmp_path: Path) -> None:
+def test_trec_eval_version_probe_accepts_release_reported_9_0_7(tmp_path: Path) -> None:
     executable = _version_probe_script(
-        tmp_path / "trec_eval", stdout="trec_eval 9.0.8\n"
+        tmp_path / "trec_eval", stdout="trec_eval version 9.0.7\n"
     )
-    probe = probe_trec_eval(executable, expected_version="9.0.8")
+    probe = probe_trec_eval(executable, expected_reported_version="9.0.7")
     require_trec_eval_version(probe)
     assert probe == {
         "command": [str(executable), "-v"],
         "returncode": 0,
-        "stdout": "trec_eval 9.0.8\n",
+        "stdout": "trec_eval version 9.0.7\n",
         "stderr": "",
-        "parsed_version": "9.0.8",
-        "expected_version": "9.0.8",
-        "version_matches_expected": True,
+        "binary_reported_version": "9.0.7",
+        "expected_reported_version": "9.0.7",
+        "binary_reported_version_matches_expected": True,
     }
 
 
 def test_trec_eval_version_probe_rejects_other_version(tmp_path: Path) -> None:
     executable = _version_probe_script(
-        tmp_path / "trec_eval", stdout="trec_eval 9.0.7\n"
+        tmp_path / "trec_eval", stdout="trec_eval 9.0.8\n"
     )
-    probe = probe_trec_eval(executable, expected_version="9.0.8")
-    assert probe["version_matches_expected"] is False
-    with pytest.raises(ValueError, match="differs from the production protocol"):
+    probe = probe_trec_eval(executable, expected_reported_version="9.0.7")
+    assert probe["binary_reported_version_matches_expected"] is False
+    with pytest.raises(ValueError, match="differs from the production binary contract"):
         require_trec_eval_version(probe)
 
 
@@ -488,8 +502,8 @@ def test_trec_eval_version_probe_rejects_unrecognized_output(
     executable = _version_probe_script(
         tmp_path / "trec_eval", stdout="usage only\n"
     )
-    probe = probe_trec_eval(executable, expected_version="9.0.8")
-    assert probe["parsed_version"] is None
+    probe = probe_trec_eval(executable, expected_reported_version="9.0.7")
+    assert probe["binary_reported_version"] is None
     with pytest.raises(ValueError, match="recognizable semantic version"):
         require_trec_eval_version(probe)
 
@@ -500,10 +514,114 @@ def test_trec_eval_version_probe_rejects_nonzero_returncode(
     executable = _version_probe_script(
         tmp_path / "trec_eval", stderr="broken\n", returncode=3
     )
-    probe = probe_trec_eval(executable, expected_version="9.0.8")
+    probe = probe_trec_eval(executable, expected_reported_version="9.0.7")
     assert probe["returncode"] == 3
     with pytest.raises(ValueError, match="failed before official evaluation"):
         require_trec_eval_version(probe)
+
+
+def _trec_provenance_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path, Path]:
+    (tmp_path / "opt/bin").mkdir(parents=True, exist_ok=True)
+    executable = _version_probe_script(
+        tmp_path / "opt/bin/trec_eval", stdout="trec_eval version 9.0.7\n"
+    )
+    config_path = tmp_path / "configs/rerank.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("fixture: true\n", encoding="utf-8")
+    provenance_path = tmp_path / "artifacts/work/phase2/trec_eval_build_provenance.json"
+    provenance_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "source_repository": "https://github.com/usnistgov/trec_eval.git",
+        "source_tag": "v9.0.8",
+        "source_commit": "1" * 40,
+        "source_tree_clean": True,
+        "fresh_checkout": True,
+        "makefile_sha256": "3" * 64,
+        "binary_path": str(executable.resolve()),
+        "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "binary_reported_version": "9.0.7",
+        "expected_release_version": "9.0.8",
+        "known_upstream_version_string_mismatch": True,
+        "build_command": "make -j2",
+        "compiler": "fixture cc 1.0",
+        "built_at": "2026-08-02T00:00:00+00:00",
+    }
+    provenance_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    config: dict[str, object] = {
+        "_config_path": str(config_path),
+        "paths": {"repository_root": ".."},
+        "evaluation": {
+            "trec_eval_executable": str(executable),
+            "trec_eval_expected_release": "9.0.8",
+            "trec_eval_expected_source_tag": "v9.0.8",
+            "trec_eval_expected_source_commit": "1" * 40,
+            "trec_eval_expected_reported_version": "9.0.7",
+            "trec_eval_known_version_string_mismatch": True,
+            "trec_eval_provenance_path": (
+                "artifacts/work/phase2/trec_eval_build_provenance.json"
+            ),
+        },
+    }
+    return config, executable, provenance_path
+
+
+def test_trec_eval_exact_release_provenance_passes(tmp_path: Path) -> None:
+    config, executable, _ = _trec_provenance_fixture(tmp_path)
+    report = validate_trec_eval_build_provenance(config, executable=executable)
+    assert report["source_tag"] == "v9.0.8"
+    assert report["source_commit"] == "1" * 40
+    assert report["fresh_checkout"] is True
+    assert report["makefile_sha256"] == "3" * 64
+    assert report["binary_reported_version"] == "9.0.7"
+    assert report["expected_release_version"] == "9.0.8"
+    assert report["binary_hash_matches_provenance"] is True
+    assert report["release_provenance_matches_expected"] is True
+    assert report["evaluation_protocol_status"] == "PASS"
+
+
+def test_trec_eval_system_binary_without_provenance_fails(tmp_path: Path) -> None:
+    config, executable, provenance_path = _trec_provenance_fixture(tmp_path)
+    provenance_path.unlink()
+    with pytest.raises(ValueError, match="JSON file does not exist"):
+        validate_trec_eval_build_provenance(config, executable=executable)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source_commit", "2" * 40, "release provenance differs"),
+        ("source_tag", "v9.0.7", "release provenance differs"),
+        ("source_tree_clean", False, "release provenance differs"),
+        ("fresh_checkout", False, "release provenance differs"),
+        ("binary_reported_version", "9.0.8", "release provenance differs"),
+        (
+            "known_upstream_version_string_mismatch",
+            False,
+            "release provenance differs",
+        ),
+        ("build_command", "sed -i Makefile", "unpatched make build"),
+        ("makefile_sha256", "invalid", "makefile_sha256 is invalid"),
+    ],
+)
+def test_trec_eval_forged_provenance_fails(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    config, executable, provenance_path = _trec_provenance_fixture(tmp_path)
+    payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    provenance_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        validate_trec_eval_build_provenance(config, executable=executable)
+
+
+def test_trec_eval_changed_binary_hash_fails(tmp_path: Path) -> None:
+    config, executable, provenance_path = _trec_provenance_fixture(tmp_path)
+    executable.write_text(executable.read_text() + "# changed\n", encoding="utf-8")
+    executable.chmod(0o755)
+    with pytest.raises(ValueError, match="SHA-256 differs"):
+        validate_trec_eval_build_provenance(config, executable=executable)
 
 
 def _raw_tie_frame(values: list[float]) -> pd.DataFrame:
