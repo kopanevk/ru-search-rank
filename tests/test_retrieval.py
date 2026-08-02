@@ -655,7 +655,7 @@ def test_colab_runner_gates_top100_cache_after_official_dev_top1000() -> None:
         )
     )
     cells = ["".join(cell["source"]) for cell in notebook["cells"]]
-    assert len(cells) == 14
+    assert len(cells) == 15
     assert "TREC_EVAL_TAG = 'v9.0.8'" in cells[3]
     assert "/usr/local/bin/trec_eval" in cells[3]
     assert "'-m', 'pytest', '-q'" in cells[5]
@@ -666,7 +666,14 @@ def test_colab_runner_gates_top100_cache_after_official_dev_top1000() -> None:
     assert "'--split', 'train'" in cells[7]
     assert "'--split', 'dev'" in cells[8]
     assert "evaluate-bm25" in cells[9]
-    assert "build-candidate-cache" in cells[10]
+    # The real corpus smoke sits between the official gate and the heavy cache.
+    assert "REAL COLAB SMOKE" in cells[10]
+    assert "smoke-corpus-access" in cells[10]
+    assert "build-candidate-cache" not in cells[10]
+    assert "build-candidate-cache" in cells[11]
+    assert "CORPUS_SMOKE_PASSED" in cells[11]
+    assert "validate-candidates" in cells[12]
+    assert "package-phase1" in cells[13]
 
     config = yaml.safe_load((repository / "configs/retrieval.yaml").read_text())
     assert config["retrieval"]["retrieval_hits"] == {"train": 100, "dev": 1000}

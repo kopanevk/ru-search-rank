@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
 from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
@@ -23,17 +25,30 @@ from typing import Any, Sequence
 import zipfile
 
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 
+from .corpus import (
+    CORPUS_FIELDS,
+    CorpusAccessError,
+    HubShardSource,
+    LocalShardSource,
+    MissingCandidatePassagesError,
+    ShardSource,
+    assert_no_dataset_script,
+    extract_candidate_passages,
+    iter_shard_rows,
+    resolve_hub_shards,
+    shard_names,
+    sort_shard_names,
+)
 from .data import (
     CANDIDATE_COLUMNS,
-    MissingCandidatePassagesError,
     download_annotation_files,
     inspect_miracl_ru,
     load_qrels,
     load_topics,
     read_candidate_table,
-    stream_candidate_passages,
     validate_candidate_schema,
     validate_passages,
     validate_queries,
@@ -216,6 +231,98 @@ def _require_external_environment(config: dict[str, Any]) -> dict[str, Any]:
             )
         )
     return report
+
+
+class StageError(RuntimeError):
+    """A stage failure that names its command, paths, cause, and recovery cell."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        command: str,
+        inputs: dict[str, str],
+        outputs: dict[str, str],
+        root_cause: str,
+        reusable: str,
+        repeat_cell: str,
+    ) -> None:
+        self.stage = stage
+        payload = {
+            "stage": stage,
+            "command": command,
+            "input_paths": inputs,
+            "output_or_temp_paths": outputs,
+            "root_cause": root_cause,
+            "safe_to_reuse": reusable,
+            "repeat_cell": repeat_cell,
+        }
+        super().__init__(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _corpus_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Read and validate the pinned static-shard corpus contract."""
+
+    dataset = config["dataset"]
+    language = str(dataset["language"])
+    shard_count = int(dataset["corpus_shard_count"])
+    expected = shard_names(language, shard_count)
+    configured = [str(name) for name in dataset["corpus_shard_files"]]
+    if configured != expected:
+        raise ValueError(
+            "dataset.corpus_shard_files must list the official shards in numeric "
+            f"order 0..{shard_count - 1}; expected {expected[:3]}... got "
+            f"{configured[:3]}..."
+        )
+    assert_no_dataset_script(configured)
+    if str(dataset.get("corpus_repo_type", "dataset")) != "dataset":
+        raise ValueError("dataset.corpus_repo_type must be 'dataset'")
+    revision = str(dataset["corpus_revision"])
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError(
+            "dataset.corpus_revision must be an immutable 40-character commit SHA; "
+            f"got {revision!r}"
+        )
+    batch_rows = int(dataset["corpus_passage_batch_rows"])
+    if batch_rows <= 0:
+        raise ValueError("dataset.corpus_passage_batch_rows must be positive")
+    cache_dir = dataset.get("corpus_cache_dir")
+    local_dir = dataset.get("corpus_local_dir")
+    return {
+        "repo_id": str(dataset["corpus_source"]),
+        "revision": revision,
+        "language": language,
+        "shard_count": shard_count,
+        "shards": configured,
+        "batch_rows": batch_rows,
+        "cache_dir": (
+            _resolve_repository_path(config, str(cache_dir)) if cache_dir else None
+        ),
+        "local_dir": (
+            _resolve_repository_path(config, str(local_dir)) if local_dir else None
+        ),
+    }
+
+
+def _corpus_source(config: dict[str, Any]) -> ShardSource:
+    settings = _corpus_settings(config)
+    if settings["local_dir"] is not None:
+        # Explicit offline override for already-materialized official shards.
+        return LocalShardSource(
+            language=settings["language"],
+            shard_count=settings["shard_count"],
+            directory=settings["local_dir"],
+        )
+    cache_dir = settings["cache_dir"]
+    if cache_dir is not None:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    return HubShardSource(
+        language=settings["language"],
+        shard_count=settings["shard_count"],
+        repo_id=settings["repo_id"],
+        revision=settings["revision"],
+        cache_dir=cache_dir,
+    )
 
 
 def _artifact_path(config: dict[str, Any], key: str) -> Path:
@@ -847,6 +954,11 @@ def _validate_retrieval_config_contract(config: dict[str, Any]) -> dict[str, Any
             "language",
             "corpus_source",
             "corpus_revision",
+            "corpus_repo_type",
+            "corpus_shard_count",
+            "corpus_shard_files",
+            "corpus_cache_dir",
+            "corpus_passage_batch_rows",
             "annotations_revision",
             "train_topics_path",
             "topics",
@@ -932,6 +1044,7 @@ def _validate_retrieval_config_contract(config: dict[str, Any]) -> dict[str, Any
         raise ValueError("official index_name must be miracl-v1.0-ru")
     if config["reproduction_gate"].get("official_topic") != "miracl-v1.0-ru-dev":
         raise ValueError("official dev topic ID must be miracl-v1.0-ru-dev")
+    _corpus_settings(config)
 
     configured_paths: list[Path] = []
     configured_paths.extend(_artifact_path(config, key) for key in config["artifacts"])
@@ -1819,13 +1932,18 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
             [frame["docid"] for frame in candidate_frames.values()], ignore_index=True
         ).astype("string")
     )
+    work_dir = _resolve_repository_path(config, config["paths"]["work_dir"])
+    work_dir.mkdir(parents=True, exist_ok=True)
+    staging_passages = work_dir / "passages.staging.parquet"
+    corpus_source = _corpus_source(config)
     extraction_started = time.perf_counter()
     try:
-        passages = stream_candidate_passages(
+        extraction_report = extract_candidate_passages(
             candidate_docids,
-            dataset_name=str(config["dataset"]["corpus_source"]),
-            language=str(config["dataset"]["language"]),
-            revision=str(config["dataset"]["corpus_revision"]),
+            staging_passages,
+            source=corpus_source,
+            batch_rows=int(_corpus_settings(config)["batch_rows"]),
+            log=lambda message: print(message, flush=True),
         )
     except MissingCandidatePassagesError as exc:
         preview_docids = set(exc.missing_docids[:10])
@@ -1833,14 +1951,47 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
             candidate_frames,
             only_docids=preview_docids,
         )
-        raise MissingCandidatePassagesError(
+        detailed = MissingCandidatePassagesError(
             exc.missing_docids,
             candidate_context=context,
+            shards_visited=exc.shards_visited,
+            lines_visited=exc.lines_visited,
+        )
+        raise StageError(
+            stage="build-candidate-cache/passage-extraction",
+            command=(
+                "python -m rusearchrank.cli build-candidate-cache "
+                "--config configs/retrieval.yaml"
+            ),
+            inputs={
+                "train_run": _portable_repository_path(
+                    config, _artifact_path(config, "train_run")
+                ),
+                "dev_top100_run": _portable_repository_path(config, dev_top100_path),
+                "corpus_repo": str(corpus_source.describe()),
+            },
+            outputs={"staging_passages": str(staging_passages)},
+            root_cause=str(detailed),
+            reusable=(
+                "raw BM25 runs, dev top-100 run and the reproduction audit are "
+                "untouched and can be reused"
+            ),
+            repeat_cell="Cell 12 (build-candidate-cache) after Cell 11 smoke passes",
+        ) from exc
+    except CorpusAccessError as exc:
+        raise StageError(
+            stage="build-candidate-cache/corpus-access",
+            command=(
+                "python -m rusearchrank.cli build-candidate-cache "
+                "--config configs/retrieval.yaml"
+            ),
+            inputs={"corpus_repo": str(corpus_source.describe())},
+            outputs={"staging_passages": str(staging_passages)},
+            root_cause=f"{type(exc).__name__}: {exc}",
+            reusable="every artifact produced by Cells 8-10 is untouched",
+            repeat_cell="Cell 11 (REAL COLAB SMOKE), then Cell 12",
         ) from exc
     extraction_seconds = time.perf_counter() - extraction_started
-    validate_passages(passages)
-    if set(passages["docid"].astype("string")) != candidate_docids:
-        raise ValueError("passage extraction did not produce exact candidate coverage")
 
     current_inputs = _candidate_input_metadata(
         config,
@@ -1854,10 +2005,20 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
     _atomic_parquet(candidate_frames["train"], output_paths["train_candidates"])
     _atomic_parquet(candidate_frames["dev"], output_paths["dev_candidates"])
     _atomic_parquet(queries, output_paths["queries"])
-    _atomic_parquet(passages, output_paths["passages"])
-    work_path = _resolve_repository_path(
-        config, config["paths"]["work_dir"]
-    ) / "candidate_cache.json"
+    staging_passages.replace(output_paths["passages"])
+    # The passage table is validated row by row while it is written, so the
+    # published file only needs its docid column read back for exact coverage.
+    published = pq.read_table(output_paths["passages"], columns=["docid"])
+    published_docids = set(published.column("docid").to_pylist())
+    passage_count = published.num_rows
+    if published_docids != candidate_docids or passage_count != len(candidate_docids):
+        missing = sorted(candidate_docids.difference(published_docids))
+        extra = sorted(published_docids.difference(candidate_docids))
+        raise ValueError(
+            "passage extraction did not produce exact candidate coverage: "
+            f"missing={missing[:10]}, extra={extra[:10]}, rows={passage_count}"
+        )
+    work_path = work_dir / "candidate_cache.json"
     output_metadata = {
         name: _file_metadata(config, path) for name, path in output_paths.items()
     }
@@ -1870,7 +2031,8 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
                 "--config configs/retrieval.yaml"
             ),
             "passage_extraction_seconds": extraction_seconds,
-            "unique_passages": int(len(passages)),
+            "passage_extraction": extraction_report,
+            "unique_passages": int(passage_count),
             "train_rows": int(len(candidate_frames["train"])),
             "dev_rows": int(len(candidate_frames["dev"])),
             "dev_top1000_run": _portable_repository_path(config, dev_run_path),
@@ -1891,11 +2053,294 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
             "train_rows": int(len(candidate_frames["train"])),
             "dev_rows": int(len(candidate_frames["dev"])),
             "queries": int(len(queries)),
-            "unique_passages": int(len(passages)),
+            "unique_passages": int(passage_count),
             "passage_extraction_seconds": extraction_seconds,
+            "shards_visited": extraction_report["shards_visited"],
+            "lines_visited": extraction_report["lines_visited"],
+            "early_stop": extraction_report["early_stop"],
         }
     )
     return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _SingleShardSource(ShardSource):
+    """One already-resolved shard, used by the smoke test only."""
+
+    shard_name: str = ""
+    shard_path: Path = Path(".")
+
+    def names(self) -> list[str]:
+        return [self.shard_name]
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "kind": "single_shard",
+            "shard": self.shard_name,
+            "path": str(self.shard_path),
+            "loader": "gzip + json.loads",
+            "dataset_script_used": False,
+            "trust_remote_code": False,
+        }
+
+    def local_path(self, name: str) -> Path:
+        if name != self.shard_name:
+            raise ValueError(f"unexpected shard request: {name}")
+        return self.shard_path
+
+
+def _smoke_corpus_access(args: argparse.Namespace) -> int:
+    """Run a cheap but completely real corpus/Parquet/ZIP round trip.
+
+    Every step touches the same code the full candidate cache uses: the pinned
+    Hugging Face revision, one real static JSONL.GZ shard, real gzip and JSON
+    parsing, a real Parquet write and read back, a real manifest, a real ZIP,
+    real extraction and a real SHA-256 revalidation. Nothing is downloaded
+    beyond a single shard and no production artifact is written.
+    """
+
+    config = _load_retrieval_config(args.config)
+    settings = _corpus_settings(config)
+    checks: list[dict[str, Any]] = []
+
+    def record(name: str, detail: dict[str, Any]) -> None:
+        checks.append({"check": name, "status": "PASS", **detail})
+
+    work_root = _resolve_repository_path(config, config["paths"]["work_dir"])
+    work_root.mkdir(parents=True, exist_ok=True)
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix="rusearchrank-corpus-smoke-", dir=work_root)
+    )
+    started = datetime.now(timezone.utc)
+    cleaned = False
+    try:
+        if args.shards_dir:
+            shards_directory = _resolve_repository_path(config, args.shards_dir)
+            source: ShardSource = LocalShardSource(
+                language=settings["language"],
+                shard_count=settings["shard_count"],
+                directory=shards_directory,
+            )
+            resolution = {
+                "kind": "local_directory",
+                "directory": str(shards_directory),
+                "shards": source.names(),
+            }
+        else:
+            source = _corpus_source(config)
+            resolution = resolve_hub_shards(
+                repo_id=settings["repo_id"],
+                revision=settings["revision"],
+                language=settings["language"],
+                shard_count=settings["shard_count"],
+            )
+        # 1. pinned revision availability, 3. no dataset script is ever executed
+        record(
+            "pinned_revision_available",
+            {
+                "repo_id": settings["repo_id"],
+                "revision": settings["revision"],
+                "resolution": resolution,
+            },
+        )
+        assert_no_dataset_script(source.names())
+        record(
+            "no_dataset_script_loader",
+            {
+                "denied": ["miracl-corpus.py"],
+                "loader": source.describe()["loader"],
+                "datasets_load_dataset_used": False,
+                "trust_remote_code": False,
+            },
+        )
+        names = source.names()
+        if names != sort_shard_names(names) or len(names) != settings["shard_count"]:
+            raise ValueError("official shard list is not in numeric order")
+        record(
+            "numeric_shard_order",
+            {"first": names[:3], "last": names[-3:], "count": len(names)},
+        )
+
+        # 2. first shard availability
+        shard_name = names[int(args.shard_index)]
+        shard_path = source.local_path(shard_name)
+        record(
+            "shard_available",
+            {
+                "shard": shard_name,
+                "local_path": str(shard_path),
+                "size_bytes": shard_path.stat().st_size,
+            },
+        )
+
+        # 4-7. real gzip open, valid JSON, required fields, string docid
+        rows: list[dict[str, str]] = []
+        max_rows = int(args.max_rows)
+        stream = iter_shard_rows(shard_path, shard=shard_name, max_rows=max_rows)
+        with contextlib.closing(stream):
+            for _, record_row in stream:
+                rows.append(record_row)
+        if len(rows) < int(args.min_passages):
+            raise ValueError(
+                f"shard {shard_name} yielded only {len(rows)} rows; "
+                f"at least {args.min_passages} are required for the smoke test"
+            )
+        if any(not isinstance(row["docid"], str) for row in rows):
+            raise ValueError("corpus docid must always stay a string")
+        record(
+            "gzip_json_fields_and_string_docid",
+            {
+                "shard": shard_name,
+                "rows_parsed": len(rows),
+                "fields": list(CORPUS_FIELDS),
+                "docid_type": "str",
+                "first_docids": [row["docid"] for row in rows[:3]],
+            },
+        )
+
+        # 8. filter several real passages exactly like the candidate cache does
+        selected = [row["docid"] for row in rows[:: max(1, len(rows) // 25)]][:25]
+        if len(selected) < min(25, len(rows)):
+            selected = [row["docid"] for row in rows[:25]]
+        requested = set(selected)
+        passages_path = temporary_root / "smoke_passages.parquet"
+        extraction = extract_candidate_passages(
+            requested,
+            passages_path,
+            source=_SingleShardSource(
+                language=settings["language"],
+                shard_count=1,
+                shard_name=shard_name,
+                shard_path=shard_path,
+            ),
+            batch_rows=max(1, len(requested) // 3),
+        )
+        record(
+            "real_passage_filtering",
+            {
+                "requested": len(requested),
+                "found": extraction["found_docids"],
+                "batches_written": extraction["batches_written"],
+                "lines_visited": extraction["lines_visited"],
+                "early_stop": extraction["early_stop"],
+            },
+        )
+
+        # 9-10. real Parquet write and read back
+        reloaded = pd.read_parquet(passages_path)
+        validate_passages(reloaded)
+        if set(reloaded["docid"].astype("string")) != requested:
+            raise ValueError("smoke Parquet does not cover the requested docids")
+        record(
+            "parquet_write_and_read_back",
+            {
+                "path": str(passages_path),
+                "rows": int(len(reloaded)),
+                "columns": list(reloaded.columns),
+                "size_bytes": passages_path.stat().st_size,
+            },
+        )
+
+        # 11. real manifest with sizes and hashes
+        manifest_path = temporary_root / "smoke_manifest.json"
+        passages_hash = _sha256(passages_path)
+        manifest = {
+            "status": "PASS",
+            "created_at": started.isoformat(),
+            "artifacts": [
+                {
+                    "path": passages_path.name,
+                    "size_bytes": passages_path.stat().st_size,
+                    "sha256": passages_hash,
+                    "row_count": int(len(reloaded)),
+                    "schema": {
+                        column: str(dtype) for column, dtype in reloaded.dtypes.items()
+                    },
+                    "producer_command": (
+                        "python -m rusearchrank.cli smoke-corpus-access "
+                        "--config configs/retrieval.yaml"
+                    ),
+                    "input_hashes": {"corpus_shard": shard_name},
+                }
+            ],
+        }
+        _write_json(manifest_path, manifest)
+        record("temporary_manifest", {"path": str(manifest_path), "entries": 1})
+
+        # 12-14. real ZIP, real extraction, real hash revalidation
+        archive_path = temporary_root / "smoke_results.zip"
+        members = [passages_path.name, manifest_path.name]
+        with zipfile.ZipFile(
+            archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as archive:
+            archive.write(passages_path, arcname=passages_path.name)
+            archive.write(manifest_path, arcname=manifest_path.name)
+        with zipfile.ZipFile(archive_path) as archive:
+            if archive.namelist() != members:
+                raise ValueError("smoke ZIP does not contain the exact member list")
+            corrupt = archive.testzip()
+            if corrupt is not None:
+                raise ValueError(f"smoke ZIP CRC validation failed for {corrupt}")
+            for info in archive.infolist():
+                member = Path(info.filename)
+                if member.is_absolute() or ".." in member.parts or info.is_dir():
+                    raise ValueError(f"unsafe smoke ZIP member: {info.filename}")
+            extraction_root = temporary_root / "extracted"
+            archive.extractall(extraction_root)
+        record(
+            "zip_created_and_extracted",
+            {
+                "path": str(archive_path),
+                "size_bytes": archive_path.stat().st_size,
+                "members": members,
+            },
+        )
+        extracted_manifest = _read_json(extraction_root / manifest_path.name)
+        if extracted_manifest != manifest:
+            raise ValueError("smoke manifest changed after ZIP extraction")
+        extracted_passages = extraction_root / passages_path.name
+        extracted_hash = _sha256(extracted_passages)
+        if extracted_hash != passages_hash:
+            raise ValueError("smoke Parquet SHA-256 changed after ZIP extraction")
+        extracted_frame = pd.read_parquet(extracted_passages)
+        validate_passages(extracted_frame)
+        if len(extracted_frame) != len(reloaded):
+            raise ValueError("smoke Parquet row count changed after ZIP extraction")
+        record(
+            "hash_revalidated_after_extraction",
+            {"sha256": extracted_hash, "rows": int(len(extracted_frame))},
+        )
+
+        payload = {
+            "status": "PASS",
+            "stage": "real-corpus-smoke",
+            "started_at": started.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "source": source.describe(),
+            "shard": shard_name,
+            "rows_parsed": len(rows),
+            "requested_passages": len(requested),
+            "extraction": extraction,
+            "checks": checks,
+            "full_corpus_downloaded": False,
+            "production_artifacts_written": [],
+            "temporary_root": str(temporary_root),
+        }
+        report_path = _resolve_repository_path(config, args.output)
+        _write_json(report_path, payload)
+        payload["report"] = _portable_repository_path(config, report_path)
+        _print_json(payload)
+        # 15. cleanup only after a successful report
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        cleaned = True
+        return 0
+    finally:
+        if not cleaned and temporary_root.is_dir():
+            print(
+                "corpus smoke failed; diagnostic files preserved at "
+                f"{temporary_root}",
+                file=sys.stderr,
+            )
 
 
 def _resolve_trec_eval_executable(config: dict[str, Any]) -> Path:
@@ -2451,10 +2896,20 @@ def _package_phase1(args: argparse.Namespace) -> int:
         "archive": archive_path.exists(),
         "manifest": manifest_path.exists(),
     }
-    if any(existing_package.values()) and not all(existing_package.values()):
+    # A freshly cloned repository ships a placeholder manifest and no ZIP, so a
+    # missing ZIP beside an existing manifest is the normal first-run state.
+    # It is only reported as partial when the caller refused to overwrite.
+    if (
+        any(existing_package.values())
+        and not all(existing_package.values())
+        and not args.overwrite
+    ):
         raise ValueError(
             "partial package output detected and preserved: "
-            f"{existing_package}. Use --overwrite only after review."
+            f"{existing_package}; manifest={_portable_repository_path(config, manifest_path)}, "
+            f"archive={_portable_repository_path(config, archive_path)}. "
+            "Rerun the packaging cell with --overwrite to rebuild both from the "
+            "validated candidate cache."
         )
     if all(existing_package.values()) and not args.overwrite:
         try:
@@ -2778,6 +3233,36 @@ def build_parser() -> argparse.ArgumentParser:
     bm25_parser.add_argument("--overwrite", action="store_true")
     bm25_parser.set_defaults(func=_run_bm25)
 
+    smoke_parser = subparsers.add_parser(
+        "smoke-corpus-access",
+        help=(
+            "real cheap corpus/Parquet/ZIP round trip against the pinned "
+            "revision; required before the full candidate cache"
+        ),
+    )
+    smoke_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
+    smoke_parser.add_argument(
+        "--shard-index", type=int, default=0, help="which official shard to sample"
+    )
+    smoke_parser.add_argument(
+        "--max-rows", type=int, default=2000, help="rows parsed from the shard"
+    )
+    smoke_parser.add_argument(
+        "--min-passages",
+        type=int,
+        default=25,
+        help="minimum real passages the smoke must filter and materialize",
+    )
+    smoke_parser.add_argument(
+        "--shards-dir",
+        default=None,
+        help="use already-materialized local shards instead of the Hub",
+    )
+    smoke_parser.add_argument(
+        "--output", default=str(DEFAULT_AUDIT_DIR / "corpus_smoke.json")
+    )
+    smoke_parser.set_defaults(func=_smoke_corpus_access)
+
     cache_parser = subparsers.add_parser(
         "build-candidate-cache",
         help="join qrels and stream only top-100 candidate passages",
@@ -2814,8 +3299,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
+    except StageError as exc:
+        print(f"error: stage {exc.stage} failed\n{exc}", file=sys.stderr)
+        return 1
     except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 
