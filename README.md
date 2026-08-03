@@ -7,14 +7,15 @@ RuSearchRank проверяет двухэтапный поиск по русс�
 → cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 → reranking
 ```
 
-Сейчас реализован только **Phase 0**: контракты данных и кандидатов, безопасные
-smoke-команды, проверка checkpoint и план воспроизведения BM25. Обучения,
-финального evaluation и полной загрузки/индексации корпуса в репозитории нет.
+Репозиторий содержит воспроизводимые протоколы Phase 1 (BM25), Phase 2
+(zero-shot reranking) и Phase 3 (supervised fine-tuning). Тяжёлые production
+этапы выполняются только в зафиксированных Colab-ноутбуках; локальный набор
+проверяет алгоритмы, контракты артефактов и failure paths без полного обучения.
 
-Статус gate на 2026-08-02: 25 unit-тестов проходят; реальные Russian MIRACL
-corpus/topics/qrels проверены; checkpoint smoke inference проходит на CPU и
-MPS. Готовый официальный BM25 index подтверждён, но retrieval не запускался:
-локально отсутствует Java 21, поэтому полный gate запланирован в Linux-среде.
+Локальный gate проверяет unit-, fixture-E2E- и notebook-контракты; реальные
+Russian MIRACL corpus/topics/qrels ранее проверены. Тяжёлый Phase 3 smoke,
+production training и официальный dev evaluation требуют Colab CUDA и здесь не
+выдаются за выполненные.
 
 ## Установка
 
@@ -120,3 +121,51 @@ v9.0.8. Recall@100, MRR@10, condensed nDCG, paired bootstrap, sparse-judgment
 диагностика и depth profile K=10/20/50 являются диагностическими. Финальный ZIP
 содержит score Parquet, официальный K=100 run, четыре metrics JSON, byte-exact
 snapshot протокола и non-self-referential manifest.
+
+## Phase 3: supervised fine-tuning
+
+Phase 3 обучает тот же pinned cross-encoder на MIRACL Russian train и полностью
+изолирует финальный evaluation split до атомарной записи
+`reports/audit/checkpoint_selection.json`. Production training и полный scoring
+на Mac запрещены; точный порядок запуска находится в
+`scripts/run_finetune.ipynb` и статически проверяется
+`scripts/validate_phase3_notebook.py`.
+
+Основной Colab-порядок:
+
+```bash
+python -m rusearchrank.cli build-training-split --config configs/finetune.yaml
+python -m rusearchrank.cli build-training-pairs --config configs/finetune.yaml --regime judged_only
+python -m rusearchrank.cli build-training-pairs --config configs/finetune.yaml --regime weak_negatives
+python -m rusearchrank.cli build-training-pairs --config configs/finetune.yaml --regime control_c1
+python -m rusearchrank.cli validate-checkpoint --config configs/finetune.yaml --checkpoint base
+python -m rusearchrank.cli smoke-finetune --config configs/finetune.yaml --limit-pairs 64
+python -m rusearchrank.cli finetune --config configs/finetune.yaml --run-id C1
+python -m rusearchrank.cli finetune --config configs/finetune.yaml --run-id A1
+python -m rusearchrank.cli finetune --config configs/finetune.yaml --run-id A2
+python -m rusearchrank.cli finetune --config configs/finetune.yaml --run-id B1
+python -m rusearchrank.cli select-checkpoint --config configs/finetune.yaml
+python -m rusearchrank.cli prepare-dev-evaluation --config configs/finetune.yaml
+python -m rusearchrank.cli score-finetuned --config configs/finetune.yaml
+python -m rusearchrank.cli evaluate-phase3 --config configs/finetune.yaml
+python -m rusearchrank.cli package-phase3 --config configs/finetune.yaml
+```
+
+Все режимы используют только positives внутри BM25 top-100. `judged_only` и
+`weak_negatives` обучаются на разных популяциях запросов: второй режим включает
+positive-запросы без judged negative, поэтому их описательная дельта смешивает
+большее число негативов на запрос и большее число пригодных запросов. Оба
+`usable_query_count` публикуются в `pairs_manifest.json`.
+
+Вес 0.5 уменьшает вклад отдельной weak-пары, но не фиксирует их совокупную долю:
+при 8 judged + 8 weak она равна 33%, при 2 judged + 8 weak — 67%, без judged —
+100%. Манифест публикует полное распределение по запросам. Ранги 26–100, до
+8 weak документов, вес 0.5 и cap 8/8/16 — консервативные preregistered
+эвристики, зафиксированные до финальной оценки, а не найденные оптимумы.
+
+Validation A/B является `exploratory_post_selection`: тот же holdout выбирает
+learning rate, epoch, лучший judged-only run и итоговый fine-tuned checkpoint.
+Поэтому сравнение не является confirmatory и не поддерживает причинную
+интерпретацию. Финальная оценка выполняется один раз для содержимого
+`artifacts/models/best_finetuned/`; `production_system` выбирается отдельно и
+может остаться zero-shot.

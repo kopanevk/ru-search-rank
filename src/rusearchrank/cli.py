@@ -54,6 +54,7 @@ from .data import (
     validate_passages,
     validate_queries,
 )
+from . import data as data_module
 from .evaluation import (
     assert_candidate_set_invariant,
     build_qrels_split_audit,
@@ -68,6 +69,9 @@ from .evaluation import (
     stratified_delta_summary,
 )
 from . import rerank as rerank_module
+from . import training_data as training_data_module
+from . import training as training_module
+from . import phase3_eval as phase3_eval_module
 from .retrieval import (
     build_retrieval_depth_audit,
     join_qrels,
@@ -365,6 +369,63 @@ def _annotation_paths(config: dict[str, Any]) -> dict[str, dict[str, Path]]:
         raw_dir=_resolve_repository_path(config, config["paths"]["raw_dir"]),
         expected_rows={str(key): int(value) for key, value in dataset["expected_rows"].items()},
     )
+
+
+def _annotation_paths_for_split(
+    config: dict[str, Any], split: str
+) -> dict[str, Path]:
+    """Download and validate exactly one annotation split.
+
+    Phase 1 keeps the historical all-splits command as its default.  Phase 3
+    uses this narrower path so the train annotations can be materialized while
+    final-evaluation annotations remain unopened and absent until selection.
+    """
+
+    if split != "train":
+        raise ValueError("the isolated single-split path only materializes train")
+    raw_dir = _resolve_repository_path(config, config["paths"]["raw_dir"])
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "topics": raw_dir / f"topics.miracl-v1.0-ru-{split}.tsv",
+        "qrels": raw_dir / f"qrels.miracl-v1.0-ru-{split}.tsv",
+    }
+    pending: dict[Path, Path] = {}
+    for kind, path in paths.items():
+        if path.is_file():
+            continue
+        payload = data_module._fetch_text(  # type: ignore[attr-defined]
+            str(config["dataset"][kind][split]), 120.0
+        )
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        if temporary.exists():
+            raise RuntimeError(
+                f"diagnostic annotation download already exists: {temporary}"
+            )
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        pending[path] = temporary
+
+    topics_source = pending.get(paths["topics"], paths["topics"])
+    qrels_source = pending.get(paths["qrels"], paths["qrels"])
+    topics = load_topics(topics_source, split=split)
+    qrels = load_qrels(qrels_source, split=split)
+    expected_topics = int(config["dataset"]["expected_rows"][f"{split}_queries"])
+    expected_qrels = int(config["dataset"]["expected_rows"][f"{split}_qrels"])
+    if len(topics) != expected_topics or len(qrels) != expected_qrels:
+        raise RuntimeError(
+            f"official {split} annotations have unexpected row counts: "
+            f"queries={len(topics)} (expected {expected_topics}), "
+            f"qrels={len(qrels)} (expected {expected_qrels})"
+        )
+    if qrels.duplicated(["query_id", "docid"], keep=False).any():
+        raise RuntimeError(f"official {split} qrels contain duplicate pairs")
+    if (qrels["relevance_grade"] < 0).any():
+        raise RuntimeError(f"official {split} qrels contain negative grades")
+    for final_path, temporary in pending.items():
+        temporary.replace(final_path)
+    return paths
 
 
 def _expected_annotation_paths(config: dict[str, Any]) -> dict[str, dict[str, Path]]:
@@ -935,7 +996,31 @@ def _validate_candidates(args: argparse.Namespace) -> int:
 
 def _prepare_annotations(args: argparse.Namespace) -> int:
     config = _load_retrieval_config(args.config)
-    downloaded = _annotation_paths(config)
+    requested_split = str(getattr(args, "split", "all"))
+    if requested_split == "all":
+        downloaded = _annotation_paths(config)
+    else:
+        downloaded = {
+            requested_split: _annotation_paths_for_split(config, requested_split)
+        }
+    if requested_split != "all":
+        split_paths = downloaded[requested_split]
+        configured_train = _expected_annotation_paths(config)["train"]["topics"]
+        if split_paths["topics"].resolve() != configured_train.resolve():
+            raise ValueError(
+                "dataset.train_topics_path must identify the official downloaded "
+                "train TSV"
+            )
+        _, train_metadata = _validate_train_topics(config)
+        payload: dict[str, Any] = {
+            "status": "ok",
+            "split": "train",
+            "train_topics": train_metadata,
+            "train_qrels": _portable_repository_path(config, split_paths["qrels"]),
+        }
+        _print_json(payload)
+        return 0
+
     configured_train = _expected_annotation_paths(config)["train"]["topics"]
     if downloaded["train"]["topics"].resolve() != configured_train.resolve():
         raise ValueError(
@@ -3559,6 +3644,7 @@ def _rerank_score(
         batch_size_override=args.batch_size,
         overwrite=bool(args.overwrite),
         scorer=scorer,
+        checkpoint=getattr(args, "checkpoint", None),
     )
     _print_json(report)
     return 0
@@ -4177,12 +4263,99 @@ def _package_phase2(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_phase3_config(args: argparse.Namespace) -> dict[str, Any]:
+    return training_data_module.load_finetune_config(args.config)
+
+
+def _build_training_split_phase3(args: argparse.Namespace) -> int:
+    report = training_data_module.build_training_split(
+        _load_phase3_config(args), overwrite=bool(args.overwrite)
+    )
+    _print_json(report)
+    return 0
+
+
+def _build_training_pairs_phase3(args: argparse.Namespace) -> int:
+    report = training_data_module.build_training_pairs(
+        _load_phase3_config(args),
+        regime=str(args.regime),
+        overwrite=bool(args.overwrite),
+    )
+    _print_json(report)
+    return 0
+
+
+def _validate_checkpoint_phase3(args: argparse.Namespace) -> int:
+    report = training_module.validate_checkpoint(
+        _load_phase3_config(args), checkpoint=str(args.checkpoint)
+    )
+    _print_json(report)
+    return 0
+
+
+def _smoke_finetune_phase3(args: argparse.Namespace) -> int:
+    report = training_module.smoke_finetune(
+        _load_phase3_config(args), limit_pairs=int(args.limit_pairs)
+    )
+    _print_json(report)
+    return 0
+
+
+def _finetune_phase3(args: argparse.Namespace) -> int:
+    report = training_module.run_finetune(
+        _load_phase3_config(args),
+        run_id=str(args.run_id),
+        resume=bool(args.resume),
+        overwrite=bool(args.overwrite),
+    )
+    _print_json(report)
+    return 0
+
+
+def _select_checkpoint_phase3(args: argparse.Namespace) -> int:
+    report = phase3_eval_module.select_checkpoint(
+        _load_phase3_config(args), overwrite=bool(args.overwrite)
+    )
+    _print_json(report)
+    return 0
+
+
+def _prepare_dev_evaluation_phase3(args: argparse.Namespace) -> int:
+    report = phase3_eval_module.prepare_dev_evaluation(_load_phase3_config(args))
+    _print_json(report)
+    return 0
+
+
+def _score_finetuned_phase3(args: argparse.Namespace) -> int:
+    report = phase3_eval_module.score_finetuned(
+        _load_phase3_config(args), overwrite=bool(args.overwrite)
+    )
+    _print_json(report)
+    return 0
+
+
+def _evaluate_phase3(args: argparse.Namespace) -> int:
+    report = phase3_eval_module.evaluate_phase3(
+        _load_phase3_config(args), overwrite=bool(args.overwrite)
+    )
+    _print_json(report)
+    return 0
+
+
+def _package_phase3(args: argparse.Namespace) -> int:
+    report = phase3_eval_module.package_phase3(
+        _load_phase3_config(args), overwrite=bool(args.overwrite)
+    )
+    _print_json(report)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m rusearchrank.cli",
         description=(
             "RuSearchRank Phase 0 checks, guarded Phase 1 retrieval, and "
-            "Phase 2 zero-shot reranking"
+            "Phase 2 zero-shot reranking plus isolated Phase 3 fine-tuning"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -4203,6 +4376,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     annotations_parser.add_argument(
         "--config", default=str(DEFAULT_RETRIEVAL_CONFIG)
+    )
+    annotations_parser.add_argument(
+        "--split",
+        choices=("all", "train"),
+        default="all",
+        help="materialize all annotations or exactly one split",
     )
     annotations_parser.set_defaults(func=_prepare_annotations)
 
@@ -4365,6 +4544,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--device", choices=("auto", "cuda", "mps", "cpu"), default="auto"
     )
     rerank_score_parser.add_argument("--batch-size", type=int, default=None)
+    rerank_score_parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional local fine-tuned checkpoint directory.",
+    )
     rerank_score_parser.add_argument("--overwrite", action="store_true")
     rerank_score_parser.set_defaults(func=_rerank_score)
 
@@ -4404,6 +4588,111 @@ def build_parser() -> argparse.ArgumentParser:
     )
     phase2_package_parser.add_argument("--overwrite", action="store_true")
     phase2_package_parser.set_defaults(func=_package_phase2)
+
+    phase3_split_parser = subparsers.add_parser(
+        "build-training-split",
+        help="materialize the isolated train-fit/train-validation query split",
+    )
+    phase3_split_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_split_parser.add_argument("--overwrite", action="store_true")
+    phase3_split_parser.set_defaults(func=_build_training_split_phase3)
+
+    phase3_pairs_parser = subparsers.add_parser(
+        "build-training-pairs",
+        help="materialize one preregistered Phase 3 pair regime",
+    )
+    phase3_pairs_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_pairs_parser.add_argument(
+        "--regime", choices=training_data_module.PAIR_REGIMES, required=True
+    )
+    phase3_pairs_parser.add_argument("--overwrite", action="store_true")
+    phase3_pairs_parser.set_defaults(func=_build_training_pairs_phase3)
+
+    phase3_checkpoint_parser = subparsers.add_parser(
+        "validate-checkpoint",
+        help="evaluate S0 or a local checkpoint on train validation groups",
+    )
+    phase3_checkpoint_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_checkpoint_parser.add_argument("--checkpoint", default="base")
+    phase3_checkpoint_parser.set_defaults(func=_validate_checkpoint_phase3)
+
+    phase3_smoke_parser = subparsers.add_parser(
+        "smoke-finetune",
+        help="run the real-model two-step Phase 3 CUDA smoke gate",
+    )
+    phase3_smoke_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_smoke_parser.add_argument("--limit-pairs", type=int, default=64)
+    phase3_smoke_parser.set_defaults(func=_smoke_finetune_phase3)
+
+    phase3_train_parser = subparsers.add_parser(
+        "finetune", help="run a registered CUDA fine-tuning experiment"
+    )
+    phase3_train_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_train_parser.add_argument(
+        "--run-id", choices=("C1", "A1", "A2", "B1"), required=True
+    )
+    phase3_train_parser.add_argument("--resume", action="store_true")
+    phase3_train_parser.add_argument("--overwrite", action="store_true")
+    phase3_train_parser.set_defaults(func=_finetune_phase3)
+
+    phase3_select_parser = subparsers.add_parser(
+        "select-checkpoint",
+        help="select and atomically publish the validation winner before dev access",
+    )
+    phase3_select_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_select_parser.add_argument("--overwrite", action="store_true")
+    phase3_select_parser.set_defaults(func=_select_checkpoint_phase3)
+
+    phase3_prepare_parser = subparsers.add_parser(
+        "prepare-dev-evaluation",
+        help="append the ledger and materialize guarded evaluation qrels",
+    )
+    phase3_prepare_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_prepare_parser.set_defaults(func=_prepare_dev_evaluation_phase3)
+
+    phase3_score_parser = subparsers.add_parser(
+        "score-finetuned",
+        help="score exactly the published best_finetuned checkpoint",
+    )
+    phase3_score_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_score_parser.add_argument("--overwrite", action="store_true")
+    phase3_score_parser.set_defaults(func=_score_finetuned_phase3)
+
+    phase3_evaluate_parser = subparsers.add_parser(
+        "evaluate-phase3",
+        help="run final BM25/zero-shot/fine-tuned comparison and diagnostics",
+    )
+    phase3_evaluate_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_evaluate_parser.add_argument("--overwrite", action="store_true")
+    phase3_evaluate_parser.set_defaults(func=_evaluate_phase3)
+
+    phase3_package_parser = subparsers.add_parser(
+        "package-phase3",
+        help="build and revalidate the exact Phase 3 result and model archives",
+    )
+    phase3_package_parser.add_argument(
+        "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
+    )
+    phase3_package_parser.add_argument("--overwrite", action="store_true")
+    phase3_package_parser.set_defaults(func=_package_phase3)
     return parser
 
 

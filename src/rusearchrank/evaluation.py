@@ -950,3 +950,114 @@ def stratified_delta_summary(
         }
     result["invariants"] = invariants
     return result
+
+
+def rank_candidates_by_score(
+    candidates: pd.DataFrame,
+    scores: pd.DataFrame,
+    *,
+    score_column: str = "score",
+) -> pd.DataFrame:
+    """Join exact candidate keys and rank float scores with the frozen tie-break."""
+
+    _require_columns(candidates, {"query_id", "docid"}, "candidates")
+    _require_columns(scores, {"query_id", "docid", score_column}, "scores")
+    base = candidates[["query_id", "docid"]].copy()
+    values = scores[["query_id", "docid", score_column]].copy()
+    for label, frame in (("candidates", base), ("scores", values)):
+        frame[["query_id", "docid"]] = frame[["query_id", "docid"]].astype("string")
+        if frame.duplicated(["query_id", "docid"], keep=False).any():
+            raise ValueError(f"{label} contain duplicate query-document keys")
+    left = set(map(tuple, base[["query_id", "docid"]].to_numpy()))
+    right = set(map(tuple, values[["query_id", "docid"]].to_numpy()))
+    if left != right:
+        raise ValueError("score keys do not exactly match candidate keys")
+    numeric = pd.to_numeric(values[score_column], errors="coerce")
+    if numeric.isna().any() or not np.isfinite(numeric).all():
+        raise ValueError("ranking scores must be finite")
+    values[score_column] = numeric.astype("float32")
+    ranked = base.merge(
+        values,
+        on=["query_id", "docid"],
+        how="inner",
+        validate="one_to_one",
+        sort=False,
+    ).sort_values(
+        ["query_id", score_column, "docid"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    )
+    ranked["rank"] = (
+        ranked.groupby("query_id", sort=False).cumcount().add(1).astype("int64")
+    )
+    return ranked[["query_id", "docid", "rank", score_column]].reset_index(drop=True)
+
+
+def evaluate_ranked_ndcg_at_10(
+    ranking: pd.DataFrame,
+    qrels: pd.DataFrame,
+    *,
+    query_ids: Iterable[str],
+) -> dict[str, Any]:
+    """Evaluate full ranked groups with qrels-derived ideal DCG at cutoff 10."""
+
+    _require_columns(ranking, {"query_id", "docid"}, "ranking")
+    rank_column = "rank" if "rank" in ranking.columns else "bm25_rank"
+    _require_columns(ranking, {rank_column}, "ranking")
+    normalized = ranking[["query_id", "docid", rank_column]].copy()
+    normalized.columns = ["query_id", "docid", "bm25_rank"]
+    report = evaluate_bm25_metrics(
+        normalized,
+        qrels,
+        query_ids=query_ids,
+        ndcg_cutoff=10,
+        recall_cutoff=100,
+    )
+    return {
+        "query_count": int(report["query_count"]),
+        "ndcg_at_10": float(report["aggregate"]["ndcg_at_10"]),
+        "per_query": {
+            str(row["query_id"]): float(row["ndcg_at_10"])
+            for row in report["per_query"]
+        },
+    }
+
+
+def mean_reciprocal_rank_at_10(
+    ranking: pd.DataFrame,
+    qrels: pd.DataFrame,
+    *,
+    query_ids: Iterable[str],
+) -> dict[str, Any]:
+    """Compute diagnostic MRR@10 over an explicit query universe."""
+
+    normalized_qrels = _normalise_qrels(qrels)
+    relevant = set(
+        map(
+            tuple,
+            normalized_qrels.loc[
+                normalized_qrels["relevance_grade"].gt(0), ["query_id", "docid"]
+            ].astype("string").to_numpy(),
+        )
+    )
+    normalized = _normalise_ranking(ranking)
+    groups = {
+        str(query_id): group.sort_values("bm25_rank", kind="mergesort")
+        for query_id, group in normalized.groupby("query_id", sort=False)
+    }
+    per_query: dict[str, float] = {}
+    for query_id in dict.fromkeys(str(value) for value in query_ids):
+        reciprocal = 0.0
+        group = groups.get(query_id)
+        if group is not None:
+            for row in group.loc[group["bm25_rank"].le(10)].itertuples(index=False):
+                if (query_id, str(row.docid)) in relevant:
+                    reciprocal = 1.0 / int(row.bm25_rank)
+                    break
+        per_query[query_id] = reciprocal
+    if not per_query:
+        raise ValueError("MRR query universe must not be empty")
+    return {
+        "mrr_at_10": float(np.mean(list(per_query.values()))),
+        "per_query": per_query,
+    }
