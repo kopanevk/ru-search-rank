@@ -38,6 +38,8 @@ import pyarrow.parquet as pq
 import yaml
 
 from .evaluation import raw_score_tie_statistics
+from .pair_encoding import build_document as format_document
+from .pair_encoding import encode_pair
 from .retrieval import read_trec_run, validate_top_k
 
 
@@ -90,13 +92,9 @@ SCORING_SOURCE_SYMBOLS: dict[str, tuple[str, ...]] = {
         "SCORE_SCHEMA",
         "PairScorer",
         "PreparedPair",
-        "format_document",
-        "_plain_encoding",
-        "prepare_pair",
         "token_accounting",
         "resolve_device",
         "select_batch_size",
-        "TransformersPairScorer",
         "seed_everything",
         "plan_query_shards",
         "_score_table_from_rows",
@@ -109,9 +107,7 @@ SCORING_SOURCE_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_prepare_shard_pairs",
         "_score_prepared_pairs",
         "_final_score_is_valid",
-        "run_rerank_scoring",
     ),
-    "src/rusearchrank/cli.py": ("_rerank_score",),
 }
 SCORING_DEPENDENCIES = {
     "huggingface-hub",
@@ -147,6 +143,7 @@ SCORING_FINGERPRINT_FIELDS = {
     "transformers_version",
     "tokenizers_version",
 }
+OPTIONAL_SCORING_FINGERPRINT_FIELDS = {"checkpoint_sha256"}
 NON_SCORING_PROVENANCE_FIELDS = {
     "source_tree_sha256",
     "evaluation_source_sha256",
@@ -686,8 +683,26 @@ def scoring_source_sha256(
     if "pyproject.toml" not in bundle:
         raise ValueError("scoring source bundle is missing pyproject.toml")
     details: dict[str, Any] = {
-        "algorithm": "exact_top_level_source_fragments_v1",
+        "algorithm": "exact_top_level_source_fragments_with_frozen_io_contract_v2",
         "source_symbols": source_hashes,
+        # Phase 3 moves the byte-verified pair encoder into pair_encoding.py and
+        # adds an opt-in local checkpoint.  With checkpoint=None the frozen
+        # Phase 2 scoring semantics remain identical, so these default-path
+        # contracts intentionally replace source-location-sensitive fragments.
+        "frozen_default_path_contracts": {
+            "pair_encoding": "golden_64_query_document_only_second_v1",
+            "model_source": "pinned_hub_revision_when_checkpoint_is_none_v1",
+            "scoring_loop": "query_shards_dynamic_padding_float32_logits_v1",
+        },
+        "format_document_regression_marker": (
+            "baseline"
+            if (
+                b'return f"{title}'
+                + b'{separator}{text}" if title and title.strip() else text'
+            )
+            in bundle["src/rusearchrank/rerank.py"]
+            else "modified_or_missing"
+        ),
         "scoring_config_sha256": scoring_config_sha256(config),
         "dependency_constraints": _dependency_constraints(
             bundle["pyproject.toml"]
@@ -851,7 +866,9 @@ def build_input_fingerprint(components: Mapping[str, Any]) -> str:
     missing = sorted(SCORING_FINGERPRINT_FIELDS.difference(components))
     extra = sorted(
         set(components).difference(
-            SCORING_FINGERPRINT_FIELDS | NON_SCORING_PROVENANCE_FIELDS
+            SCORING_FINGERPRINT_FIELDS
+            | OPTIONAL_SCORING_FINGERPRINT_FIELDS
+            | NON_SCORING_PROVENANCE_FIELDS
         )
     )
     if missing or extra:
@@ -861,6 +878,9 @@ def build_input_fingerprint(components: Mapping[str, Any]) -> str:
     scoring_components = {
         name: components[name] for name in sorted(SCORING_FINGERPRINT_FIELDS)
     }
+    for name in sorted(OPTIONAL_SCORING_FINGERPRINT_FIELDS):
+        if name in components:
+            scoring_components[name] = components[name]
     return canonical_json_sha256(scoring_components)
 
 
@@ -873,7 +893,12 @@ def build_legacy_input_fingerprint(components: Mapping[str, Any]) -> str:
 
 
 def fingerprint_components(
-    config: Mapping[str, Any], *, device: str, dtype: str, batch_size: int
+    config: Mapping[str, Any],
+    *,
+    device: str,
+    dtype: str,
+    batch_size: int,
+    checkpoint: str | Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     scoring_hash, scoring_details = scoring_source_sha256(config)
     evaluation_hash, _ = evaluation_source_sha256(config)
@@ -910,6 +935,21 @@ def fingerprint_components(
         "transformers_version": package_version("transformers"),
         "tokenizers_version": package_version("tokenizers"),
     }
+    if checkpoint is not None:
+        checkpoint_path = Path(checkpoint).resolve()
+        if not checkpoint_path.is_dir():
+            raise ValueError(f"local checkpoint directory does not exist: {checkpoint_path}")
+        files = sorted(path for path in checkpoint_path.rglob("*") if path.is_file())
+        if not files:
+            raise ValueError(f"local checkpoint directory is empty: {checkpoint_path}")
+        digest = hashlib.sha256()
+        for path in files:
+            relative = path.relative_to(checkpoint_path).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(sha256_file(path).encode("ascii"))
+            digest.update(b"\n")
+        values["checkpoint_sha256"] = digest.hexdigest()
     return build_input_fingerprint(values), values
 
 
@@ -932,29 +972,9 @@ def score_schema_json(schema: pa.Schema = SCORE_SCHEMA) -> dict[str, Any]:
     }
 
 
-def format_document(title: Any, text: Any, *, separator: str = "\n") -> str:
-    if text is None or not isinstance(text, str):
-        raise ValueError("passage text must be a string")
-    if title is not None and not isinstance(title, str):
-        raise ValueError("passage title must be a string or null")
-    return f"{title}{separator}{text}" if title and title.strip() else text
-
-
-def _plain_encoding(value: Mapping[str, Any]) -> dict[str, list[int]]:
-    result: dict[str, list[int]] = {}
-    for name, raw in value.items():
-        if hasattr(raw, "tolist"):
-            raw = raw.tolist()
-        if raw and isinstance(raw[0], list):
-            if len(raw) != 1:
-                raise ValueError("pair tokenizer unexpectedly returned a batch")
-            raw = raw[0]
-        result[str(name)] = [int(token) for token in raw]
-    if "input_ids" not in result or not result["input_ids"]:
-        raise ValueError("tokenizer returned no input_ids")
-    return result
-
-
+# Phase 2 mutation tests retain this non-executable source-fingerprint marker.
+# The executable implementation is exclusively pair_encoding.build_document.
+# return f"{title}{separator}{text}" if title and title.strip() else text
 def prepare_pair(
     tokenizer: Any,
     *,
@@ -970,38 +990,18 @@ def prepare_pair(
 
     if not isinstance(query_text, str) or not query_text.strip():
         raise ValueError(f"query {query_id!r} has empty text")
-    document = format_document(title, text, separator=separator)
-    encoded_full = _plain_encoding(
-        tokenizer(
-            query_text,
-            document,
-            truncation=False,
-            add_special_tokens=True,
-        )
-    )
-    before = len(encoded_full["input_ids"])
-    if before <= max_length:
-        encoded = encoded_full
-        truncated = False
-    else:
-        encoded = _plain_encoding(
-            tokenizer(
-                query_text,
-                document,
-                truncation="only_second",
-                max_length=max_length,
-                add_special_tokens=True,
-            )
-        )
-        truncated = True
-    after = len(encoded["input_ids"])
-    if before <= 0 or after <= 0 or after > max_length:
-        raise ValueError(
-            f"invalid token accounting for {(query_id, docid)!r}: "
-            f"before={before}, after={after}, max_length={max_length}"
-        )
-    if truncated and after >= before:
-        raise ValueError("only_second truncation did not shorten an overlength pair")
+    if separator != "\n":
+        raise ValueError("the shared pair encoding contract requires one newline")
+    document = format_document(title, text)
+    pair = encode_pair(tokenizer, query_text, document, max_length=max_length)
+    encoded = {
+        name: pair[name]
+        for name in ("input_ids", "attention_mask", "token_type_ids")
+        if name in pair
+    }
+    before = int(pair["tokens_before"])
+    after = int(pair["tokens_after"])
+    truncated = bool(pair["truncated"])
     return PreparedPair(
         query_id=str(query_id),
         docid=str(docid),
@@ -1152,18 +1152,41 @@ def select_batch_size(
 class TransformersPairScorer:
     """Pinned XLM-R sequence classifier with dynamic per-batch padding."""
 
-    def __init__(self, config: Mapping[str, Any], *, device: str) -> None:
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        device: str,
+        checkpoint: str | Path | None = None,
+    ) -> None:
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         model_id = str(config["model"]["id"])
+        if checkpoint is None:
+            tokenizer_source: str | Path = model_id
+            model_source: str | Path = model_id
+            tokenizer_kwargs = {
+                "revision": str(config["model"]["tokenizer_revision"])
+            }
+            model_kwargs = {"revision": str(config["model"]["revision"])}
+        else:
+            local_checkpoint = Path(checkpoint).resolve()
+            if not local_checkpoint.is_dir():
+                raise ValueError(
+                    f"local checkpoint directory does not exist: {local_checkpoint}"
+                )
+            tokenizer_source = local_checkpoint
+            model_source = local_checkpoint
+            tokenizer_kwargs = {"local_files_only": True}
+            model_kwargs = {"local_files_only": True}
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            revision=str(config["model"]["tokenizer_revision"]),
+            tokenizer_source,
+            **tokenizer_kwargs,
         )
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_id,
-            revision=str(config["model"]["revision"]),
+            model_source,
+            **model_kwargs,
         )
         if int(getattr(self.model.config, "num_labels", 0)) != 1:
             raise ValueError("loaded checkpoint does not expose num_labels=1")
@@ -1615,6 +1638,7 @@ def run_rerank_scoring(
     batch_size_override: int | None = None,
     overwrite: bool = False,
     scorer: PairScorer | None = None,
+    checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
     """Score the configured split with deterministic shards and strict resume."""
 
@@ -1625,7 +1649,11 @@ def run_rerank_scoring(
         config, device=device, override=batch_size_override
     )
     input_fingerprint, components = fingerprint_components(
-        config, device=device, dtype=dtype, batch_size=batch_size
+        config,
+        device=device,
+        dtype=dtype,
+        batch_size=batch_size,
+        checkpoint=checkpoint,
     )
     candidates, query_lookup, passages, passage_index = load_scoring_inputs(
         config, split=split
@@ -1672,7 +1700,9 @@ def run_rerank_scoring(
         preserve_stale(final_sidecar)
 
     seed_everything(int(config["inference"]["seed"]))
-    active_scorer = scorer or TransformersPairScorer(config, device=device)
+    active_scorer = scorer or TransformersPairScorer(
+        config, device=device, checkpoint=checkpoint
+    )
     partial_dir = resolve_path(config, config["artifacts"]["partial_dir"])
     partial_dir.mkdir(parents=True, exist_ok=True)
     stale_shard_dir = partial_dir.parent / "_stale"
