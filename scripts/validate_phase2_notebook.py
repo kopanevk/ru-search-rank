@@ -46,7 +46,7 @@ def main() -> int:
         1: [
             "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
             "1427fd652930e4ba29e8149678df786c240d8825",
-            "125,200",
+            "125 200",
         ],
         2: ["platform.system() != 'Linux'", "nvidia-smi", "MIN_FREE_GIB", "MIN_RAM_GIB"],
         3: [
@@ -60,9 +60,10 @@ def main() -> int:
             "ALLOW_OVERWRITE_PHASE2 = False",
         ],
         4: [
-            "openjdk-21-jdk-headless",
+            "build-essential",
             "TREC_EVAL_TAG = 'v9.0.8'",
             "TREC_EVAL_COMMIT = 'd95ca64e14a47d763ae349fb65e6d8cde4141dbd'",
+            "TREC_EVAL_BIN",
             "shutil.rmtree(TREC_EVAL_DIR)",
             "'clone', '--depth', '1', '--branch', TREC_EVAL_TAG",
             "rev-list",
@@ -70,14 +71,14 @@ def main() -> int:
             "'diff', '--cached', '--quiet'",
             "makefile_sha256_before",
             "makefile_sha256_after",
-            "'/opt/bin/trec_eval', '-v'",
+            "str(TREC_EVAL_BIN), '-v'",
             "9\\.0\\.7",
             "binary_sha256",
             "trec_eval_build_provenance.json",
             "known_upstream_version_string_mismatch",
             "'fresh_checkout': True",
             "'makefile_sha256': makefile_sha256_after",
-            "shutil.which('trec_eval')",
+            "TREC_EVAL_PATH",
         ],
         5: ["3.12", "RUN_PYTHON", "pip_install_project"],
         6: [
@@ -175,8 +176,8 @@ def main() -> int:
     )
     evaluation = config["evaluation"]
     require(
-        evaluation["trec_eval_executable"] == "/opt/bin/trec_eval",
-        "Phase 2 must use the provenance-bound /opt/bin/trec_eval",
+        evaluation["trec_eval_executable"] is None,
+        "Phase 2 must resolve trec_eval through TREC_EVAL_PATH or PATH",
     )
     require(
         evaluation["trec_eval_expected_release"] == "9.0.8"

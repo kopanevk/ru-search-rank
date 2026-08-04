@@ -1,21 +1,53 @@
 .DS_Store
 .idea/
+.claude/
+.env
+.env.*
 .venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
+.ipynb_checkpoints/
 .pytest_cache/
 .coverage
+.coverage.*
+htmlcov/
 build/
 dist/
+*.tmp.*
+*.stale.*
 
 # Candidate caches are reproducible artifacts, not source files.
 artifacts/candidates/*
 artifacts/raw/
 artifacts/runs/
 artifacts/work/
+artifacts/models/
+artifacts/scores/
+artifacts/training/
+artifacts/checkpoints/
 artifacts/*.zip
 *.trec
+*.parquet
+*.safetensors
+optimizer.pt
+scheduler.pt
+rng_state.pt
+
+# Отчёты полного запуска создаются заново и упаковываются в проверяемый ZIP.
+reports/metrics/
+reports/training/
+reports/audit/checkpoint_selection.json
+reports/audit/control_c1.json
+reports/audit/dev_access_ledger.jsonl
+reports/audit/environment_freeze.txt
+reports/audit/finetune_protocol.yaml
+reports/audit/finetune_smoke.json
+reports/audit/model_card.md
+reports/audit/pairs_manifest.json
+reports/audit/query_split_manifest.json
+reports/audit/resource_report.json
+reports/audit/training_manifest.json
 
 # Full retrieval caches and indexes must remain external.
 indexes/

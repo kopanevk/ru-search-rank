@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-# The deterministic CUDA workspace contract must be set before torch import.
+# Детерминированный режим CUDA нужно задать до импорта torch.
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 from collections import defaultdict
@@ -81,6 +81,7 @@ SCORING_SOURCE_FILES = (
 EVALUATION_SOURCE_FILES = (
     "src/rusearchrank/evaluation.py",
     "src/rusearchrank/phase3_eval.py",
+    "src/rusearchrank/trec_eval.py",
 )
 PINNED_MODEL_ID = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 PINNED_MODEL_REVISION = "1427fd652930e4ba29e8149678df786c240d8825"
@@ -655,6 +656,7 @@ def evaluation_config_contract(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def packaging_config_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
+        "release": copy.deepcopy(config["release"]),
         "archive": copy.deepcopy(config["archive"]),
         "artifacts": copy.deepcopy(config["artifacts"]),
     }
@@ -942,9 +944,8 @@ def validate_epoch_generation(
     actual_generation_hash = _generation_hash(generation, dict(hashes))
     if sidecar.get("model_generation_sha256") != actual_generation_hash:
         raise ValueError("epoch model_generation_sha256 mismatch")
-    # Loading a Transformers model constructs modules before applying stored
-    # weights and may otherwise advance the global CPU RNG.  Checkpoint
-    # validation must not perturb the dropout stream of the training process.
+    # Transformers создаёт модули до загрузки весов и сдвигает состояние
+    # генератора CPU. Проверка контрольной точки не должна менять dropout при обучении.
     with torch.random.fork_rng(devices=[], enabled=True):
         model = AutoModelForSequenceClassification.from_pretrained(
             generation, local_files_only=True
@@ -1468,6 +1469,8 @@ def _validation_trec_cross_check(
         phase2 = rerank_module.load_rerank_config(
             repository_root(config) / "configs/rerank.yaml"
         )
+        if config.get("_trec_eval_cli_path") is not None:
+            phase2["_trec_eval_cli_path"] = config["_trec_eval_cli_path"]
         executable = rerank_module.resolve_trec_eval(phase2)
         rerank_module.validate_trec_eval_build_provenance(
             phase2, executable=executable
@@ -2212,9 +2215,8 @@ def run_finetune(
         metrics = _load_metrics(config)
         metrics.setdefault("runs", {}).setdefault(run_id, {})[f"epoch_{epoch}"] = epoch_history
         atomic_write_json(_metrics_path(config), metrics)
-        # Persist deterministic validation/history before publishing the resume
-        # boundary.  If interrupted here, the previous resume state remains the
-        # authority and this epoch is safely replayed/replaced.
+            # Сначала сохраняем проверку и историю. При сбое прежнее состояние
+            # продолжения остаётся действующим, а эпоху можно безопасно повторить.
         resume_sidecar = publish_resume_state(
             run_dir,
             run_id=run_id,
@@ -2251,9 +2253,8 @@ def run_finetune(
             }
         )
         atomic_write_json(run_manifest_path, run_manifest)
-        # Publish the latest pointer only after the generation, resume state,
-        # validation/history, and resumable manifest are all durable.  A crash
-        # at any earlier boundary therefore leaves the previous pointer valid.
+            # Указатель обновляется последним: при более раннем сбое прежнее
+            # поколение остаётся целостным и пригодным для продолжения.
         update_latest_checkpoint(
             run_dir,
             epoch=epoch,
@@ -2290,6 +2291,136 @@ def run_finetune(
     return {"status": "PASS", "action": "trained", **finalized}
 
 
+def estimate_steady_state_resources(
+    step_measurements: Sequence[Mapping[str, Any]],
+    *,
+    run_pair_counts: Mapping[str, int],
+    run_epochs: Mapping[str, int],
+    validation_pair_count: int,
+    validation_pairs_per_second: float,
+    warmup_steps: int = 1,
+    minimum_steady_steps: int = 3,
+    full_window_query_count: int = 16,
+) -> dict[str, Any]:
+    """Estimate compute time only from full optimizer steps after warm-up."""
+
+    if warmup_steps < 0 or minimum_steady_steps <= 0:
+        raise ValueError("resource-estimator step requirements are invalid")
+    if full_window_query_count <= 0:
+        raise ValueError("full-window query count must be positive")
+    measurements = [dict(item) for item in step_measurements]
+    eligible: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for index, item in enumerate(measurements, start=1):
+        pair_count = item.get("pair_count")
+        seconds = item.get("seconds")
+        query_count = item.get("window_query_count")
+        valid_numeric = (
+            isinstance(pair_count, int)
+            and not isinstance(pair_count, bool)
+            and pair_count > 0
+            and isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and math.isfinite(float(seconds))
+            and float(seconds) > 0
+        )
+        if (
+            index > warmup_steps
+            and valid_numeric
+            and query_count == full_window_query_count
+        ):
+            eligible.append(item)
+        else:
+            rejected.append(
+                {
+                    "optimizer_step": item.get("optimizer_step", index),
+                    "reason": (
+                        "warmup"
+                        if index <= warmup_steps
+                        else "partial_or_invalid_measurement"
+                    ),
+                }
+            )
+
+    validation_rate_is_valid = (
+        isinstance(validation_pairs_per_second, (int, float))
+        and not isinstance(validation_pairs_per_second, bool)
+        and math.isfinite(float(validation_pairs_per_second))
+        and float(validation_pairs_per_second) > 0
+    )
+    reliable = (
+        len(eligible) >= minimum_steady_steps and validation_rate_is_valid
+    )
+    evidence: dict[str, Any] = {
+        "method": "aggregate_full_optimizer_steps_after_warmup",
+        "measured_optimizer_steps": len(measurements),
+        "warmup_steps_excluded": warmup_steps,
+        "required_steady_steps": minimum_steady_steps,
+        "full_window_query_count": full_window_query_count,
+        "steady_steps_used": len(eligible),
+        "rejected_steps": rejected,
+    }
+    if not reliable:
+        return {
+            "status": "estimate_unreliable_due_to_smoke_overhead",
+            "reason": (
+                "Недостаточно полных шагов после разогрева либо отсутствует "
+                "надёжное измерение скорости проверки."
+            ),
+            "estimator": evidence,
+            "steady_state_pairs_per_second": None,
+            "validation_pairs_per_second": (
+                float(validation_pairs_per_second)
+                if validation_rate_is_valid
+                else None
+            ),
+            "estimated_training_time_range_seconds": {
+                str(run_id): None for run_id in run_pair_counts
+            },
+        }
+
+    total_pairs = sum(int(item["pair_count"]) for item in eligible)
+    total_seconds = sum(float(item["seconds"]) for item in eligible)
+    steady_rate = total_pairs / total_seconds
+    individual_rates = [
+        int(item["pair_count"]) / float(item["seconds"]) for item in eligible
+    ]
+    evidence.update(
+        {
+            "steady_pair_count": total_pairs,
+            "steady_seconds": total_seconds,
+            "individual_pairs_per_second": individual_rates,
+            "uncertainty_multipliers": {"lower": 0.8, "upper": 1.4},
+            "excluded_components": [
+                "model_and_tokenizer_startup",
+                "token_cache_construction",
+                "checkpoint_and_zip_io",
+            ],
+        }
+    )
+    ranges: dict[str, list[int]] = {}
+    for run_id, pair_count in run_pair_counts.items():
+        epochs = int(run_epochs[run_id])
+        central = (
+            int(pair_count) * epochs / steady_rate
+            + int(validation_pair_count)
+            * epochs
+            / float(validation_pairs_per_second)
+        )
+        ranges[str(run_id)] = [
+            int(central * 0.8),
+            int(math.ceil(central * 1.4)),
+        ]
+    return {
+        "status": "PASS",
+        "reason": "Оценка основана на устойчивых полных шагах после разогрева.",
+        "estimator": evidence,
+        "steady_state_pairs_per_second": steady_rate,
+        "validation_pairs_per_second": float(validation_pairs_per_second),
+        "estimated_training_time_range_seconds": ranges,
+    }
+
+
 def smoke_finetune(
     config: Mapping[str, Any], *, limit_pairs: int = 64
 ) -> dict[str, Any]:
@@ -2316,9 +2447,10 @@ def smoke_finetune(
     for query_id, group in pairs.groupby("query_id", sort=True):
         selected_queries.append(str(query_id))
         selected_count += len(group)
-        if selected_count >= limit_pairs and len(selected_queries) >= 17:
+        if selected_count >= limit_pairs and len(selected_queries) >= 64:
             break
     smoke_pairs = pairs.loc[pairs["query_id"].astype("string").isin(selected_queries)].copy()
+    setup_started = time.perf_counter()
     model, tokenizer = _load_model_and_tokenizer(config)
     try:
         model.to("cuda")
@@ -2339,41 +2471,65 @@ def smoke_finetune(
     )
     optimizer = build_adamw_optimizer(model, learning_rate=2.0e-5)
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=0, num_training_steps=2
+        optimizer, num_warmup_steps=0, num_training_steps=4
     )
     groups = {
         str(query_id): group for query_id, group in smoke_pairs.groupby("query_id", sort=True)
     }
-    order = sorted(groups)[:32]
-    if len(order) < 17:
-        raise StageError("smoke-finetune/data", "smoke needs at least 17 query groups")
-    started = time.perf_counter()
+    order = sorted(groups)[:64]
+    if len(order) < 64:
+        raise StageError("smoke-finetune/data", "smoke needs at least 64 query groups")
+    setup_seconds = max(time.perf_counter() - setup_started, 1e-12)
+    smoke_pair_counter = 0
+    previous_pair_counter = 0
+    step_measurements: list[dict[str, Any]] = []
+
+    def smoke_loss(query_id: str) -> torch.Tensor:
+        nonlocal smoke_pair_counter
+        smoke_pair_counter += len(groups[query_id])
+        return model_query_loss(
+            model,
+            tokenizer,
+            cache,
+            groups[query_id],
+            device="cuda",
+            max_sequences_per_microbatch=int(
+                config["training"]["max_sequences_per_microbatch"]
+            ),
+        )
+
+    def capture_step(item: dict[str, Any]) -> None:
+        nonlocal previous_pair_counter
+        current = smoke_pair_counter
+        measurement = dict(item)
+        measurement["pair_count"] = current - previous_pair_counter
+        previous_pair_counter = current
+        step_measurements.append(measurement)
+
+    training_started = time.perf_counter()
     try:
         result = run_accumulation_epoch(
             order,
-            loss_for_query=lambda query_id: model_query_loss(
-                model,
-                tokenizer,
-                cache,
-                groups[query_id],
-                device="cuda",
-                max_sequences_per_microbatch=int(
-                    config["training"]["max_sequences_per_microbatch"]
-                ),
-            ),
+            loss_for_query=smoke_loss,
             optimizer=optimizer,
             scheduler=scheduler,
             parameters=model.parameters(),
             accumulation=16,
             max_grad_norm=1.0,
+            on_step=capture_step,
         )
     except torch.cuda.OutOfMemoryError as exc:
         raise StageError(
             "smoke-finetune/oom",
             "CUDA OOM; automatic batch-size changes are forbidden",
         ) from exc
-    if result["optimizer_steps"] != 2:
-        raise StageError("smoke-finetune/training", "smoke did not execute two optimizer steps")
+    training_seconds = max(time.perf_counter() - training_started, 1e-12)
+    if result["optimizer_steps"] != 4:
+        raise StageError("smoke-finetune/training", "smoke did not execute four optimizer steps")
+    steady_measurements = step_measurements[1:]
+    steady_pairs_per_second = sum(
+        int(item["pair_count"]) for item in steady_measurements
+    ) / sum(float(item["seconds"]) for item in steady_measurements)
     validation = score_validation(
         config, model, tokenizer, device="cuda", limit_queries=16
     )
@@ -2382,6 +2538,7 @@ def smoke_finetune(
     work_root.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix="smoke-", dir=work_root))
     try:
+        checkpoint_started = time.perf_counter()
         run_dir = temporary / "SMOKE"
         fingerprint = canonical_json_sha256({"smoke": expected})
         forward_batch = _forward_validation_batch(smoke_pairs, cache, tokenizer)
@@ -2394,9 +2551,9 @@ def smoke_finetune(
             training_fingerprint=fingerprint,
             fingerprint_components=expected,
             validation=validation,
-            optimizer_steps=2,
+            optimizer_steps=4,
             last_window_query_count=int(result["last_window_query_count"]),
-            throughput={"pairs_per_second": len(smoke_pairs) / max(time.perf_counter() - started, 1e-12)},
+            throughput={"pairs_per_second": steady_pairs_per_second},
             peak_gpu_memory_bytes=int(torch.cuda.max_memory_allocated()),
             peak_rss=peak_rss_bytes(),
             forward_batch=forward_batch,
@@ -2442,7 +2599,9 @@ def smoke_finetune(
             relative = path.relative_to(run_dir / "epoch_1")
             if sha256_file(path) != sha256_file(extraction / relative):
                 raise ValueError(f"smoke ZIP hash mismatch: {relative}")
-        elapsed = max(time.perf_counter() - started, 1e-12)
+        checkpoint_roundtrip_seconds = max(
+            time.perf_counter() - checkpoint_started, 1e-12
+        )
         report = {
             "status": "PASS",
             "real_model_forward": True,
@@ -2463,9 +2622,19 @@ def smoke_finetune(
                 "token_cache_representation"
             ],
             "throughput": {
-                "pairs_per_second": len(smoke_pairs) / elapsed,
+                "pairs_per_second": steady_pairs_per_second,
                 "validation_pairs_per_second": validation["validation_pairs_per_second"],
+                "measurement_scope": "full_optimizer_steps_after_warmup",
+                "warmup_steps_excluded": 1,
+                "steady_step_count": len(steady_measurements),
             },
+            "stage_seconds": {
+                "setup_and_token_cache": setup_seconds,
+                "steady_training_measurement": training_seconds,
+                "validation": float(validation["seconds"]),
+                "checkpoint_resume_zip_roundtrip": checkpoint_roundtrip_seconds,
+            },
+            "optimizer_step_measurements": step_measurements,
         }
         smoke_path = resolve_path(config, config["audits"]["finetune_smoke"])
         resource_path = resolve_path(config, config["audits"]["resource_report"])
@@ -2490,37 +2659,32 @@ def smoke_finetune(
         validation_pair_count = len(
             pd.read_parquet(validation_groups_path, columns=["query_id"])
         )
-        def projected_seconds(run_id: str) -> float:
-            run_epochs = int(config["runs"][run_id]["epochs"])
-            training_seconds = run_pair_counts[run_id] * run_epochs / max(
-                float(report["throughput"]["pairs_per_second"]), 1e-12
-            )
-            validation_seconds = validation_pair_count * run_epochs / max(
-                float(report["throughput"]["validation_pairs_per_second"]), 1e-12
-            )
-            return training_seconds + validation_seconds
+        estimate = estimate_steady_state_resources(
+            step_measurements,
+            run_pair_counts=run_pair_counts,
+            run_epochs={
+                run_id: int(config["runs"][run_id]["epochs"])
+                for run_id in run_pair_counts
+            },
+            validation_pair_count=validation_pair_count,
+            validation_pairs_per_second=float(
+                report["throughput"]["validation_pairs_per_second"]
+            ),
+        )
         resource = {
-            "status": "PASS",
+            **estimate,
             "peak_gpu_memory_bytes": report["peak_gpu_memory_bytes"],
             "peak_rss_bytes": report["peak_rss_bytes"],
-            "pairs_per_second": report["throughput"]["pairs_per_second"],
-            "validation_pairs_per_second": report["throughput"]["validation_pairs_per_second"],
+            "pairs_per_second": estimate["steady_state_pairs_per_second"],
             "checkpoint_size_bytes": sum(path.stat().st_size for path in members),
             "token_cache_bytes": cache_report["token_cache_bytes"],
             "token_cache_representation": cache_report[
                 "token_cache_representation"
             ],
-            "estimated_training_time_range_seconds": {
-                run_id: [
-                    int(projected_seconds(run_id) * 0.8),
-                    int(math.ceil(projected_seconds(run_id) * 1.4)),
-                ]
-                for run_id in ("A1", "A2", "B1")
-            },
+            "measured_stage_seconds": report["stage_seconds"],
         }
         atomic_write_json(resource_path, resource)
-        # The PASS gate is the final publication: it cannot exist without the
-        # successfully materialized resource report.
+    # PASS публикуется последним и возможен только после сохранения отчёта о ресурсах.
         atomic_write_json(smoke_path, report)
     except Exception as exc:
         raise StageError(
@@ -2544,6 +2708,7 @@ __all__ = [
     "disk_preflight",
     "ensure_token_cache_ram",
     "epoch_query_order",
+    "estimate_steady_state_resources",
     "estimate_token_cache_bytes",
     "evaluation_config_contract",
     "finalize_run",

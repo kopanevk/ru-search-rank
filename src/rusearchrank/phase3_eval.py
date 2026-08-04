@@ -7,6 +7,7 @@ import copy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -24,7 +25,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-# Direct imports of this module must preserve the training process contract too.
+# Прямой импорт модуля также обязан сохранять контракт процесса обучения.
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import torch
 import yaml
@@ -72,6 +73,9 @@ from .training_data import (
 
 
 RESULT_ZIP_MEMBERS = (
+    "LICENSE",
+    "NOTICE",
+    "requirements/kaggle.lock",
     "artifacts/training/query_split.parquet",
     "artifacts/training/pairs_judged_only.parquet",
     "artifacts/training/pairs_weak_negatives.parquet",
@@ -91,6 +95,7 @@ RESULT_ZIP_MEMBERS = (
     "reports/audit/control_c1.json",
     "reports/audit/finetune_smoke.json",
     "reports/audit/resource_report.json",
+    "reports/audit/environment_freeze.txt",
     "reports/audit/dev_access_ledger.jsonl",
     "reports/audit/checkpoint_selection.json",
     "reports/audit/model_card.md",
@@ -106,6 +111,8 @@ MODEL_ZIP_MEMBERS = (
     "sentencepiece.bpe.model",
     "model_card.md",
     "checkpoint_sha256.json",
+    "LICENSE",
+    "NOTICE",
 )
 BEST_FINETUNED_FILES = MODEL_ZIP_MEMBERS[:6]
 
@@ -211,6 +218,7 @@ def _current_run_training_contract(
 def _validate_selected_training_contract(
     config: Mapping[str, Any], selection: Mapping[str, Any]
 ) -> str:
+    _validate_checkpoint_selection_integrity(config, selection)
     best = selection.get("best_finetuned_checkpoint")
     if not isinstance(best, Mapping):
         raise StageError("checkpoint-contract", "best fine-tuned selection is invalid")
@@ -221,6 +229,85 @@ def _validate_selected_training_contract(
             "checkpoint-contract", "selected checkpoint training fingerprint is stale"
         )
     return fingerprint
+
+
+def _selection_payload_sha256(selection: Mapping[str, Any]) -> str:
+    body = {
+        str(name): value
+        for name, value in selection.items()
+        if name != "selection_sha256"
+    }
+    return canonical_json_sha256(body)
+
+
+def _validate_selection_payload_integrity(
+    selection: Mapping[str, Any],
+) -> str:
+    if int(selection.get("schema_version", -1)) != 2:
+        raise StageError(
+            "checkpoint-contract",
+            "checkpoint selection must use schema version 2",
+        )
+    recorded = selection.get("selection_sha256")
+    computed = _selection_payload_sha256(selection)
+    if (
+        not isinstance(recorded, str)
+        or re.fullmatch(r"[0-9a-f]{64}", recorded) is None
+        or recorded != computed
+    ):
+        raise StageError(
+            "checkpoint-contract", "checkpoint selection integrity hash is invalid"
+        )
+    if selection.get("selection_written_before_dev_access") is not True:
+        raise StageError(
+            "checkpoint-contract", "selection-before-dev declaration is missing"
+        )
+    selected_at = selection.get("selected_at")
+    try:
+        parsed = datetime.fromisoformat(str(selected_at))
+    except ValueError as exc:
+        raise StageError(
+            "checkpoint-contract", "checkpoint selection timestamp is invalid"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise StageError(
+            "checkpoint-contract", "checkpoint selection timestamp has no timezone"
+        )
+    best = selection.get("best_finetuned_checkpoint")
+    if not isinstance(best, Mapping) or re.fullmatch(
+        r"[0-9a-f]{64}", str(best.get("sha256", ""))
+    ) is None:
+        raise StageError(
+            "checkpoint-contract", "selected checkpoint SHA-256 is invalid"
+        )
+    return recorded
+
+
+def _validate_checkpoint_selection_integrity(
+    config: Mapping[str, Any], selection: Mapping[str, Any]
+) -> str:
+    recorded = _validate_selection_payload_integrity(selection)
+    metrics_path = resolve_path(
+        config, config["metrics"]["validation_checkpoint_metrics"]
+    )
+    if not metrics_path.is_file() or selection.get(
+        "validation_metrics_sha256"
+    ) != sha256_file(metrics_path):
+        raise StageError(
+            "checkpoint-contract",
+            "validation metrics changed after checkpoint selection",
+        )
+    candidate_material = {
+        "candidates": selection.get("candidates"),
+        "best_epoch_by_run": selection.get("best_epoch_by_run"),
+    }
+    if selection.get("candidate_set_sha256") != canonical_json_sha256(
+        candidate_material
+    ):
+        raise StageError(
+            "checkpoint-contract", "checkpoint candidate set integrity hash is invalid"
+        )
+    return recorded
 
 
 def _checkpoint_payload_hash(files: Mapping[str, str]) -> str:
@@ -322,7 +409,7 @@ def _publish_best_finetuned(
             "published_at": utc_now(),
         }
         atomic_write_json(temporary / "checkpoint_sha256.json", payload)
-        # Prove the copied model and tokenizer are locally loadable before publish.
+        # До публикации убеждаемся, что копии модели и токенизатора открываются локально.
         rerank.TransformersPairScorer(
             _phase3_rerank_config(config), device="cpu", checkpoint=temporary
         )
@@ -385,9 +472,9 @@ def _validation_ab_report(
         "analysis_role": "exploratory_post_selection",
         "confirmatory_inference": False,
         "reuse_disclosure": (
-            "The same validation split selected learning rate, epoch, the best "
-            "judged-only run, and the best fine-tuned checkpoint. This descriptive "
-            "post-selection comparison is not confirmatory and supports no causal claim."
+            "Одна контрольная выборка использована для выбора скорости обучения, "
+            "эпохи, лучшего запуска judged_only и контрольной точки после fine-tuning. "
+            "Это описательное сравнение после выбора не подтверждает причинный эффект."
         ),
         "judged_only_run": judged_run,
         "judged_only_epoch": int(judged["epoch"]),
@@ -401,9 +488,9 @@ def _validation_ab_report(
             "weak_negatives": weak.get("sparse_diagnostics"),
         },
         "population_disclosure": (
-            "The regimes use different query populations; B1 includes positive queries "
-            "without judged negatives, so the descriptive delta mixes more negatives per "
-            "query with more usable queries."
+            "Режимы охватывают разные множества запросов: B1 включает положительные "
+            "запросы без экспертно оценённых отрицательных документов. Поэтому разница "
+            "смешивает увеличение числа отрицательных примеров и охвата запросов."
         ),
     }
     path = resolve_path(config, config["metrics"]["validation_ab_comparison"])
@@ -424,47 +511,62 @@ def _write_model_card(
     weak = pairs_manifest["regimes"]["weak_negatives"]
     production = selection["production_system"]
     outcome = (
-        "Final evaluation has not run yet."
+        "Итоговое оценивание ещё не выполнено."
         if final_evaluation is None
-        else f"Final primary ML outcome: {final_evaluation['ml_outcome']['label']}."
+        else (
+            "Основной итог ML-эксперимента: "
+            f"`{final_evaluation['ml_outcome']['label']}`."
+        )
     )
-    text = f"""# RuSearchRank Phase 3 model card
+    production_label = {
+        "zero_shot": "исходная zero-shot модель",
+        "finetuned": "модель после fine-tuning",
+    }.get(str(production["kind"]), f"`{production['kind']}`")
+    text = f"""# Модельная карточка RuSearchRank, этап 3
 
-Base checkpoint: `{config['base_model']['id']}` at immutable revision
-`{config['base_model']['revision']}`. The cross-encoder consumes `(query,
-title + newline + text)` with `only_second` truncation at 320 tokens.
+Cross-encoder — модель, которая совместно обрабатывает запрос и документ и
+оценивает их релевантность. Основа: `{config['base_model']['id']}` в неизменяемой
+ревизии `{config['base_model']['revision']}`. На вход подаётся `query`, затем
+документ из `title`, перевода строки и `text`; документ обрезается по правилу `only_second` до 320
+токенов.
 
-Selected fine-tuned checkpoint: `{selection['best_finetuned_checkpoint']['run_id']}`
-epoch {selection['best_finetuned_checkpoint']['epoch']}. The separately selected
-production system is `{production['kind']}`; these decisions remain separate, and
-the model archive always contains the selected fine-tuned checkpoint. {outcome}
+Выбранная контрольная точка после fine-tuning:
+`{selection['best_finetuned_checkpoint']['run_id']}`, эпоха
+{selection['best_finetuned_checkpoint']['epoch']}. Отдельно выбранная рабочая
+система — {production_label}. Эти решения не объединяются: архив модели всегда
+содержит выбранную контрольную точку после fine-tuning. {outcome}
 
-## Training-data scope and limitations
+## Область обучающих данных и ограничения
 
-Only positives inside BM25 top-100 were used. Unjudged rows were never relabeled
-as relevance 0. The judged-only and weak-negative regimes use different query
-populations: usable query counts are {judged['usable_query_count']} and
-{weak['usable_query_count']} respectively. Therefore their descriptive delta
-mixes negative availability with population coverage.
+Использовались только положительные документы из top-100 BM25. Документы без
+экспертной оценки не переобозначались как нерелевантные. Режимы только с
+экспертными оценками и с weak negatives — документами без оценки, используемыми
+как слабые отрицательные примеры, — охватывают разные множества запросов:
+{judged['usable_query_count']} и {weak['usable_query_count']} соответственно.
+Поэтому описательная разница между режимами одновременно отражает доступность
+отрицательных примеров и охват запросов.
 
-A weak-pair weight of 0.5 reduces one pair's influence but does not fix the total
-weak share for a query: representative shares are 33% for 8 judged plus 8 weak,
-67% for 2 judged plus 8 weak, and 100% when judged pairs are absent. The full
-per-query distribution is recorded in `pairs_manifest.json`.
+Вес слабой пары 0,5 уменьшает влияние отдельной пары, но не фиксирует общую долю
+weak negatives для запроса. Показательные доли: 33% для 8 экспертно оценённых и
+8 слабых пар, 67% для 2 экспертно оценённых и 8 слабых пар и 100%, если
+экспертно оценённых пар нет. Полное распределение по запросам записано в
+`pairs_manifest.json`.
 
-Ranks 26-100, at most 8 sampled weak documents, weight 0.5, and caps 8/8/16 are
-preregistered conservative heuristics fixed before evaluation; they are not
-estimated optima. The validation A/B comparison is exploratory post-selection:
-the same split was used for learning-rate, epoch, judged-run, and checkpoint
-selection, so it is not confirmatory and supports no causal interpretation.
+Диапазон рангов 26–100, не более 8 слабых документов, вес 0,5 и ограничения
+8/8/16 — заранее заданные консервативные эвристики, зафиксированные до итогового
+оценивания. Они не считаются найденными оптимумами. Сравнение режимов на
+контрольной выборке является исследовательским анализом после выбора: одна и та
+же выборка использована для выбора скорости обучения, эпохи, запуска и
+контрольной точки. Поэтому сравнение не подтверждает причинный эффект.
 
-## Reproducibility
+## Воспроизводимость
 
-Training is fp32 CUDA with deterministic algorithms, one query per micro-batch,
-and optimizer updates after the exact mean of each window of up to 16 query
-losses. The final incomplete window is normalized by its actual size. This gives
-equal query gradients within one optimizer step; it does not imply equal
-contribution to total Adam updates across an epoch.
+Модель обучается на CUDA в `fp32` с детерминированными алгоритмами. Один запрос
+образует один микропакет; параметры обновляются по точному среднему в окне не
+более чем из 16 функций потерь по запросам. Последнее неполное окно нормируется
+по фактическому размеру. Так градиенты запросов получают одинаковый вес внутри
+одного шага оптимизатора, но не обязательно одинаковый вклад во все обновления
+Adam за эпоху.
 """
     path = resolve_path(config, config["audits"]["model_card"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -607,7 +709,7 @@ def select_checkpoint(
     else:
         production = {"kind": "finetuned", **best_payload}
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "selection_written_before_dev_access": True,
         "candidates": candidates,
         "best_epoch_by_run": {
@@ -623,7 +725,19 @@ def select_checkpoint(
         "production_system": production,
         "zero_shot_won": production["kind"] == "zero_shot",
         "selected_at": utc_now(),
+        "validation_metrics_sha256": sha256_file(
+            resolve_path(
+                config, config["metrics"]["validation_checkpoint_metrics"]
+            )
+        ),
     }
+    payload["candidate_set_sha256"] = canonical_json_sha256(
+        {
+            "candidates": payload["candidates"],
+            "best_epoch_by_run": payload["best_epoch_by_run"],
+        }
+    )
+    payload["selection_sha256"] = _selection_payload_sha256(payload)
     _validation_ab_report(config, metrics, best_by_run=best_by_run)
     _write_model_card(config, payload)
     atomic_write_json(selection_path, payload)
@@ -637,9 +751,42 @@ def append_dev_access_ledger(
     checkpoint_sha256: str,
     input_hashes: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Atomically append an audit event before any isolated data read."""
+    """Append a hash-chained audit event before any isolated data read."""
 
     path = resolve_path(config, config["audits"]["dev_access_ledger"])
+    selection_path = resolve_path(
+        config, config["audits"]["checkpoint_selection"]
+    )
+    if not selection_path.is_file():
+        raise StageError(
+            "dev-access-ledger", "checkpoint selection must exist before dev access"
+        )
+    selection = read_json(selection_path, training_path=False)
+    selection_sha256 = _validate_selection_payload_integrity(selection)
+    selected_at = datetime.fromisoformat(str(selection["selected_at"]))
+    expected_checkpoint = str(selection["best_finetuned_checkpoint"]["sha256"])
+    if checkpoint_sha256 != expected_checkpoint:
+        raise StageError(
+            "dev-access-ledger",
+            "dev access attempted with a checkpoint different from the selection",
+            expected_sha256=expected_checkpoint,
+            actual_sha256=checkpoint_sha256,
+        )
+    normalized_inputs = {
+        str(name): str(value) for name, value in sorted(input_hashes.items())
+    }
+    invalid_inputs = sorted(
+        name
+        for name, digest in normalized_inputs.items()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    )
+    if not normalized_inputs or invalid_inputs:
+        raise StageError(
+            "dev-access-ledger",
+            "dev input declarations must contain SHA-256 values",
+            invalid_inputs=invalid_inputs,
+        )
+    input_set_sha256 = canonical_json_sha256(normalized_inputs)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -651,21 +798,76 @@ def append_dev_access_ledger(
             if not chunk:
                 break
             existing_bytes += chunk
-        existing = []
+        existing: list[dict[str, Any]] = []
+        previous_hash = "0" * 64
+        previous_timestamp: datetime | None = None
         for line in existing_bytes.decode("utf-8").splitlines():
             if line.strip():
                 value = json.loads(line)
                 if not isinstance(value, dict):
                     raise ValueError("ledger line is not a JSON object")
+                sequence = len(existing) + 1
+                if int(value.get("schema_version", -1)) != 2:
+                    raise ValueError("dev-access ledger schema version is invalid")
+                if int(value.get("sequence", -1)) != sequence:
+                    raise ValueError("dev-access ledger sequence is invalid")
+                if value.get("previous_event_sha256") != previous_hash:
+                    raise ValueError("dev-access ledger hash chain is broken")
+                body = {
+                    str(name): field
+                    for name, field in value.items()
+                    if name != "event_sha256"
+                }
+                computed_hash = canonical_json_sha256(body)
+                if value.get("event_sha256") != computed_hash:
+                    raise ValueError("dev-access ledger event hash is invalid")
+                if value.get("selection_sha256") != selection_sha256:
+                    raise StageError(
+                        "dev-access-ledger",
+                        "checkpoint selection changed after the first dev access",
+                    )
+                if value.get("checkpoint_sha256") != expected_checkpoint:
+                    raise StageError(
+                        "dev-access-ledger",
+                        "checkpoint changed after the first dev access",
+                    )
+                if value.get("input_set_sha256") != input_set_sha256 or value.get(
+                    "input_hashes"
+                ) != normalized_inputs:
+                    raise StageError(
+                        "dev-access-ledger",
+                        "dev input declarations changed after the first access",
+                    )
+                try:
+                    timestamp = datetime.fromisoformat(str(value.get("timestamp")))
+                except ValueError as exc:
+                    raise ValueError(
+                        "dev-access ledger timestamp is invalid"
+                    ) from exc
+                if timestamp.tzinfo is None or timestamp < selected_at or (
+                    previous_timestamp is not None
+                    and timestamp < previous_timestamp
+                ):
+                    raise ValueError("dev-access ledger timestamps are invalid")
+                if value.get("repeat_access") != (sequence > 1):
+                    raise ValueError("dev-access ledger repeat marker is invalid")
                 existing.append(value)
-        repeat = any(row.get("checkpoint_sha256") == checkpoint_sha256 for row in existing)
+                previous_hash = computed_hash
+                previous_timestamp = timestamp
+        repeat = bool(existing)
         event = {
+            "schema_version": 2,
+            "sequence": len(existing) + 1,
+            "previous_event_sha256": previous_hash,
             "timestamp": utc_now(),
             "command": command,
             "checkpoint_sha256": checkpoint_sha256,
-            "input_hashes": dict(input_hashes),
+            "selection_sha256": selection_sha256,
+            "input_hashes": normalized_inputs,
+            "input_set_sha256": input_set_sha256,
             "repeat_access": repeat,
         }
+        event["event_sha256"] = canonical_json_sha256(event)
         encoded = json.dumps(event, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
         written = 0
         while written < len(encoded):
@@ -781,7 +983,7 @@ def prepare_dev_evaluation(config: Mapping[str, Any]) -> dict[str, Any]:
         checkpoint_sha256=checkpoint_hash,
         input_hashes=declared_hashes,
     )
-    # This is the only function that opens the source evaluation qrels.
+    # Только эта функция открывает исходные qrels для итогового оценивания.
     source = resolve_path(config, config["dev_inputs"]["dev_qrels"])
     _materialize_guarded_dev_qrels_source(config, source)
     declared = declared_hashes["dev_qrels"]
@@ -1010,6 +1212,8 @@ def _trec_eval(
             "prepare-dev-evaluation must run before official evaluation",
         )
     phase2 = rerank.load_rerank_config(repository_root(config) / "configs/rerank.yaml")
+    if config.get("_trec_eval_cli_path") is not None:
+        phase2["_trec_eval_cli_path"] = config["_trec_eval_cli_path"]
     executable = rerank.resolve_trec_eval(phase2)
     rerank.validate_trec_eval_build_provenance(phase2, executable=executable)
     command = [str(executable), *map(str, arguments), str(prepared), str(run_path)]
@@ -1359,6 +1563,8 @@ def evaluate_phase3(
     phase2_config = rerank.load_rerank_config(
         repository_root(config) / "configs/rerank.yaml"
     )
+    if config.get("_trec_eval_cli_path") is not None:
+        phase2_config["_trec_eval_cli_path"] = config["_trec_eval_cli_path"]
     trec_executable = rerank.resolve_trec_eval(phase2_config)
     trec_provenance = rerank.validate_trec_eval_build_provenance(
         phase2_config, executable=trec_executable
@@ -1550,67 +1756,36 @@ def _row_count(path: Path) -> int | None:
     return None
 
 
-def _manifest_common(config: Mapping[str, Any]) -> dict[str, Any]:
-    selection = read_json(
-        resolve_path(config, config["audits"]["checkpoint_selection"]), training_path=False
+def _run_provenance(
+    config: Mapping[str, Any],
+    run_id: str,
+    pairs_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    run_manifest, components, fingerprint = _current_run_training_contract(
+        config, run_id
     )
-    selected_run = selection["best_finetuned_checkpoint"]["run_id"]
-    run_manifest, _, current_fingerprint = _current_run_training_contract(
-        config, str(selected_run)
-    )
-    if selection["best_finetuned_checkpoint"].get(
-        "training_fingerprint"
-    ) != current_fingerprint:
+    regime = str(run_manifest["regime"])
+    section = pairs_manifest.get("regimes", {}).get(regime)
+    if not isinstance(section, Mapping):
         raise StageError(
-            "package-phase3", "selected training fingerprint is stale"
+            "package-phase3", f"pairs manifest is missing regime {regime}"
         )
-    pairs_manifest = read_json(
-        resolve_path(config, config["audits"]["pairs_manifest"]), training_path=False
-    )
-    section = pairs_manifest["regimes"][run_manifest["regime"]]
-    sources = source_hashes(config)
-    hashes = config_hashes(config)
-    commit, dirty = git_provenance(repository_root(config))
     return {
-        "base_model_id": config["base_model"]["id"],
-        "base_model_revision": config["base_model"]["revision"],
-        "tokenizer_revision": config["base_model"]["tokenizer_revision"],
-        "training_source_sha256": sources["training_source_sha256"],
-        "scoring_source_sha256": sources["scoring_source_sha256"],
-        "evaluation_source_sha256": sources["evaluation_source_sha256"],
-        **hashes,
-        "training_fingerprint": run_manifest["training_fingerprint"],
-        "run_id": selected_run,
-        "regime_id": run_manifest["regime"],
-        "learning_rate": run_manifest.get("learning_rate"),
-        "epochs": run_manifest.get("epochs"),
+        "run_id": run_id,
+        "regime_id": regime,
+        "learning_rate": float(run_manifest["learning_rate"]),
+        "epochs": int(run_manifest["epochs"]),
+        "training_fingerprint_sha256": fingerprint,
+        "training_fingerprint_components": components,
         "pair_file_sha256": section["pair_file_sha256"],
-        "pair_manifest_section_sha256": section["pair_manifest_section_sha256"],
-        "pair_count": section["pair_count"],
-        "usable_query_count": section["usable_query_count"],
-        "last_window_query_count": run_manifest.get("last_window_query_count"),
-        "token_cache_bytes": run_manifest.get("token_cache_bytes"),
-        "token_cache_representation": run_manifest.get("token_cache_representation"),
-        "git_commit": commit,
-        "git_dirty": dirty,
-        "python_version": platform.python_version(),
-        "torch_version": package_version("torch"),
-        "transformers_version": package_version("transformers"),
-        "tokenizers_version": package_version("tokenizers"),
-        "cuda_version": torch.version.cuda,
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "seeds": {
-            "split": config["split"]["seed"],
-            "training": config["training"]["seed"],
-            "control_bootstrap": config["control"]["c1_bootstrap_seed"],
-            "validation_ab_bootstrap": config["selection"]["ab_bootstrap_seed"],
-            "evaluation_bootstrap": config["evaluation"]["bootstrap_seed"],
-            "control_sampling": config["runs"]["C1"]["control_seed"],
-            "control_shuffle": config["runs"]["C1"]["shuffle_seed"],
-        },
+        "pair_manifest_section_sha256": section[
+            "pair_manifest_section_sha256"
+        ],
+        "pair_count": int(section["pair_count"]),
+        "usable_query_count": int(section["usable_query_count"]),
         "optimizer": {
             "id": "AdamW",
-            "learning_rate": run_manifest.get("learning_rate"),
+            "learning_rate": float(run_manifest["learning_rate"]),
             "betas": [0.9, 0.999],
             "eps": 1e-8,
             "weight_decay": config["training"]["weight_decay"],
@@ -1623,6 +1798,13 @@ def _manifest_common(config: Mapping[str, Any]) -> dict[str, Any]:
             "optimizer_steps": run_manifest.get("optimizer_steps"),
         },
         "optimizer_steps": run_manifest.get("optimizer_steps"),
+        "last_window_query_count": run_manifest.get(
+            "last_window_query_count"
+        ),
+        "token_cache_bytes": run_manifest.get("token_cache_bytes"),
+        "token_cache_representation": run_manifest.get(
+            "token_cache_representation"
+        ),
         "throughput": run_manifest.get("throughput"),
         "validation_history": run_manifest.get("validation_history"),
         "peak_rss_bytes": run_manifest.get("peak_rss_bytes"),
@@ -1634,34 +1816,341 @@ def _manifest_common(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _artifact_producer(
+    relative: str, *, selected_run_id: str
+) -> dict[str, Any]:
+    exact: dict[str, tuple[str, str, list[str]]] = {
+        "LICENSE": ("release-license", "package-phase3", []),
+        "NOTICE": ("third-party-notice", "package-phase3", []),
+        "requirements/kaggle.lock": (
+            "pinned-environment",
+            "package-phase3",
+            [],
+        ),
+        "artifacts/training/query_split.parquet": (
+            "query-split",
+            "build-training-split",
+            [],
+        ),
+        "artifacts/training/pairs_judged_only.parquet": (
+            "training-pairs",
+            "build-training-pairs --regime judged_only",
+            [],
+        ),
+        "artifacts/training/pairs_weak_negatives.parquet": (
+            "training-pairs",
+            "build-training-pairs --regime weak_negatives",
+            [],
+        ),
+        "artifacts/training/pairs_control_c1.parquet": (
+            "training-pairs",
+            "build-training-pairs --regime control_c1",
+            [],
+        ),
+        "artifacts/scores/dev_finetuned.parquet": (
+            "dev-scoring",
+            "score-finetuned",
+            [selected_run_id],
+        ),
+        "artifacts/runs/dev_rerank_finetuned_k100.trec": (
+            "trec-run",
+            "score-finetuned",
+            [selected_run_id],
+        ),
+        "reports/metrics/validation_checkpoint_metrics.json": (
+            "validation-metrics",
+            "validate-checkpoint and finetune",
+            ["C1", "A1", "A2", "B1"],
+        ),
+        "reports/metrics/validation_ab_comparison.json": (
+            "comparative-experiment",
+            "select-checkpoint",
+            ["A1", "A2", "B1"],
+        ),
+        "reports/metrics/dev_finetuned.json": (
+            "final-metrics",
+            "evaluate-phase3",
+            [selected_run_id],
+        ),
+        "reports/metrics/dev_three_way_comparison.json": (
+            "three-way-comparison",
+            "evaluate-phase3",
+            [selected_run_id],
+        ),
+        "reports/metrics/dev_score_tie_diagnostic.json": (
+            "score-tie-diagnostic",
+            "evaluate-phase3",
+            [selected_run_id],
+        ),
+        "reports/training/A1_history.json": (
+            "training-history",
+            "finetune --run-id A1",
+            ["A1"],
+        ),
+        "reports/training/A2_history.json": (
+            "training-history",
+            "finetune --run-id A2",
+            ["A2"],
+        ),
+        "reports/training/B1_history.json": (
+            "training-history",
+            "finetune --run-id B1",
+            ["B1"],
+        ),
+        "reports/audit/query_split_manifest.json": (
+            "query-split-audit",
+            "build-training-split",
+            [],
+        ),
+        "reports/audit/pairs_manifest.json": (
+            "pair-construction-audit",
+            "build-training-pairs",
+            [],
+        ),
+        "reports/audit/control_c1.json": (
+            "control-report",
+            "finetune --run-id C1",
+            ["C1"],
+        ),
+        "reports/audit/finetune_smoke.json": (
+            "smoke-gate",
+            "smoke-finetune",
+            [],
+        ),
+        "reports/audit/resource_report.json": (
+            "resource-estimate",
+            "smoke-finetune",
+            [],
+        ),
+        "reports/audit/environment_freeze.txt": (
+            "normalized-pip-freeze",
+            "package-phase3",
+            [],
+        ),
+        "reports/audit/dev_access_ledger.jsonl": (
+            "dev-access-ledger",
+            "prepare-dev-evaluation, score-finetuned, evaluate-phase3",
+            [selected_run_id],
+        ),
+        "reports/audit/checkpoint_selection.json": (
+            "checkpoint-selection",
+            "select-checkpoint",
+            ["A1", "A2", "B1"],
+        ),
+        "reports/audit/model_card.md": (
+            "model-card",
+            "select-checkpoint and evaluate-phase3",
+            [selected_run_id],
+        ),
+        "reports/audit/finetune_protocol.yaml": (
+            "protocol-snapshot",
+            "package-phase3",
+            [],
+        ),
+    }
+    if relative not in exact:
+        raise ValueError(f"artifact producer is not registered: {relative}")
+    stage, command, run_ids = exact[relative]
+    producer: dict[str, Any] = {
+        "stage": stage,
+        "cli_command": command,
+        "run_ids": run_ids,
+    }
+    regimes = {
+        "artifacts/training/pairs_judged_only.parquet": "judged_only",
+        "artifacts/training/pairs_weak_negatives.parquet": "weak_negatives",
+        "artifacts/training/pairs_control_c1.parquet": "control_c1",
+    }
+    if relative in regimes:
+        producer["regime_id"] = regimes[relative]
+    return producer
+
+
+def _entry_input_hashes(
+    config: Mapping[str, Any],
+    relative: str,
+    immutable_inputs: Mapping[str, str],
+) -> dict[str, str]:
+    if relative in {
+        "LICENSE",
+        "NOTICE",
+        "requirements/kaggle.lock",
+        "reports/audit/environment_freeze.txt",
+    }:
+        return {}
+    dev_outputs = {
+        "artifacts/scores/dev_finetuned.parquet",
+        "artifacts/runs/dev_rerank_finetuned_k100.trec",
+        "reports/metrics/dev_finetuned.json",
+        "reports/metrics/dev_three_way_comparison.json",
+        "reports/metrics/dev_score_tie_diagnostic.json",
+        "reports/audit/dev_access_ledger.jsonl",
+        "reports/audit/model_card.md",
+    }
+    if relative in dev_outputs:
+        return dict(immutable_inputs)
+    train_paths = {str(value) for value in config["inputs"].values()}
+    return {
+        path: digest
+        for path, digest in immutable_inputs.items()
+        if path in train_paths
+    }
+
+
 def build_training_manifest(config: Mapping[str, Any]) -> dict[str, Any]:
     path = resolve_path(config, config["audits"]["training_manifest"])
-    common = _manifest_common(config)
+    selection = read_json(
+        resolve_path(config, config["audits"]["checkpoint_selection"]),
+        training_path=False,
+    )
+    selection_sha256 = _validate_checkpoint_selection_integrity(config, selection)
+    selected_run_id = str(selection["best_finetuned_checkpoint"]["run_id"])
+    pairs_manifest = read_json(
+        resolve_path(config, config["audits"]["pairs_manifest"]),
+        training_path=False,
+    )
+    run_provenance = {
+        run_id: _run_provenance(config, run_id, pairs_manifest)
+        for run_id in ("C1", "A1", "A2", "B1")
+    }
+    if run_provenance[selected_run_id]["training_fingerprint_sha256"] != selection[
+        "best_finetuned_checkpoint"
+    ]["training_fingerprint"]:
+        raise StageError(
+            "package-phase3", "selected training fingerprint is stale"
+        )
     immutable_inputs = phase12_immutable_snapshot(config, require_all=True)
+    sources = source_hashes(config)
+    source_sha256 = {
+        name: sources[name]
+        for name in (
+            "training_source_sha256",
+            "scoring_source_sha256",
+            "evaluation_source_sha256",
+        )
+    }
+    configuration_sha256 = config_hashes(config)
     entries: list[dict[str, Any]] = []
+    manifest_relative = str(config["audits"]["training_manifest"])
     for relative in RESULT_ZIP_MEMBERS:
-        if relative == str(config["audits"]["training_manifest"]):
+        if relative == manifest_relative:
             continue
         source = repository_root(config) / relative
         if not source.is_file():
             raise StageError("package-phase3", f"result payload is missing: {relative}")
+        producer = _artifact_producer(relative, selected_run_id=selected_run_id)
         entries.append(
             {
                 "path": relative,
                 "size_bytes": source.stat().st_size,
-                "sha256": sha256_file(source),
+                "file_sha256": sha256_file(source),
                 "row_count": _row_count(source),
-                "schema": _schema_json(source),
-                "producer_command": "rusearchrank Phase 3 pipeline",
-                "input_hashes": immutable_inputs,
-                **common,
+                "parquet_schema": _schema_json(source),
+                "producer": producer,
+                "input_file_sha256": _entry_input_hashes(
+                    config, relative, immutable_inputs
+                ),
+                "implementation_source_sha256": source_sha256,
+                "configuration_sha256": configuration_sha256,
+                "run_provenance": [
+                    run_provenance[run_id] for run_id in producer["run_ids"]
+                ],
             }
         )
-    if any(entry["path"] == str(config["audits"]["training_manifest"]) for entry in entries):
+    if any(entry["path"] == manifest_relative for entry in entries):
         raise RuntimeError("training manifest must never contain a self-reference")
+
+    lock_path = resolve_path(config, config["release"]["environment_lock"])
+    license_path = resolve_path(config, config["release"]["license_file"])
+    notice_path = resolve_path(config, config["release"]["notice_file"])
+    for required in (lock_path, license_path, notice_path):
+        if not required.is_file():
+            raise StageError("package-phase3", f"release file is missing: {required}")
+    pinned_requirements = [
+        line.strip()
+        for line in lock_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    freeze_path = resolve_path(config, config["audits"]["environment_freeze"])
+    if not freeze_path.is_file():
+        raise StageError(
+            "package-phase3", f"environment freeze is missing: {freeze_path}"
+        )
+    normalized_freeze = [
+        line.strip()
+        for line in freeze_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    commit, dirty = git_provenance(repository_root(config))
     payload = {
-        "schema_version": 1,
+        "schema": {
+            "name": "rusearchrank.phase3.training_manifest",
+            "version": int(config["release"]["manifest_schema_version"]),
+        },
+        "schema_version": int(config["release"]["manifest_schema_version"]),
         "self_reference": False,
+        "release": {
+            "version": str(config["release"]["version"]),
+            "ref": str(config["release"]["ref"]),
+            "archive_schema_version": int(
+                config["release"]["archive_schema_version"]
+            ),
+            "implementation_version": str(config["implementation"]["version"]),
+            "selection_timestamp": selection["selected_at"],
+            "git_commit": commit,
+            "git_dirty": dirty,
+        },
+        "environment": {
+            "target_python_version": str(
+                config["release"]["kaggle_python_version"]
+            ),
+            "runtime_python_version": platform.python_version(),
+            "platform": platform.platform(),
+            "cuda_version": torch.version.cuda,
+            "gpu": (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            ),
+            "package_versions": {
+                "torch": package_version("torch"),
+                "transformers": package_version("transformers"),
+                "tokenizers": package_version("tokenizers"),
+            },
+            "lock_path": portable_path(config, lock_path),
+            "lock_file_sha256": sha256_file(lock_path),
+            "pinned_requirements": pinned_requirements,
+            "normalized_pip_freeze_path": portable_path(config, freeze_path),
+            "normalized_pip_freeze_file_sha256": sha256_file(freeze_path),
+            "normalized_pip_freeze": normalized_freeze,
+        },
+        "model": {
+            "base_model_id": config["base_model"]["id"],
+            "base_model_revision": config["base_model"]["revision"],
+            "tokenizer_revision": config["base_model"]["tokenizer_revision"],
+            "selected_run_id": selected_run_id,
+            "selected_checkpoint_file_sha256": selection[
+                "best_finetuned_checkpoint"
+            ]["sha256"],
+            "selection_sha256": selection_sha256,
+        },
+        "input_file_sha256": immutable_inputs,
+        "implementation_source_sha256": source_sha256,
+        "configuration_sha256": configuration_sha256,
+        "runs": run_provenance,
+        "licensing": {
+            "project_license": "MIT",
+            "license_path": portable_path(config, license_path),
+            "license_file_sha256": sha256_file(license_path),
+            "notice_path": portable_path(config, notice_path),
+            "notice_file_sha256": sha256_file(notice_path),
+            "third_party_terms_preserved": True,
+        },
+        "limitations": [
+            "Итоговые метрики относятся только к русской части MIRACL и top-100 BM25.",
+            "Документы без экспертной оценки не являются подтверждёнными отрицательными примерами.",
+            "Сравнение режимов на контрольной выборке носит исследовательский характер после выбора.",
+            "Запуск с GPU другого типа или иными версиями окружения требует нового отчёта о воспроизводимости.",
+        ],
+        "hash_algorithm": "SHA-256",
         "entries": entries,
     }
     atomic_write_json(path, payload)
@@ -1672,8 +2161,44 @@ def build_training_manifest(config: Mapping[str, Any]) -> dict[str, Any]:
 def _validate_training_manifest(
     config: Mapping[str, Any], manifest: Mapping[str, Any]
 ) -> None:
-    if manifest.get("schema_version") != 1 or manifest.get("self_reference") is not False:
+    expected_schema = int(config["release"]["manifest_schema_version"])
+    if (
+        manifest.get("schema_version") != expected_schema
+        or manifest.get("schema")
+        != {
+            "name": "rusearchrank.phase3.training_manifest",
+            "version": expected_schema,
+        }
+        or manifest.get("self_reference") is not False
+        or manifest.get("hash_algorithm") != "SHA-256"
+    ):
         raise ValueError("training manifest header is invalid")
+    for section in (
+        "release",
+        "environment",
+        "model",
+        "input_file_sha256",
+        "implementation_source_sha256",
+        "configuration_sha256",
+        "runs",
+        "licensing",
+        "limitations",
+    ):
+        if section not in manifest:
+            raise ValueError(f"training manifest is missing section {section}")
+    if manifest["release"].get("version") != config["release"]["version"] or manifest[
+        "release"
+    ].get("ref") != config["release"]["ref"]:
+        raise ValueError("training manifest release identity is invalid")
+    if manifest.get("input_file_sha256") != phase12_immutable_snapshot(
+        config, require_all=True
+    ):
+        raise ValueError("training manifest input hashes are stale")
+    if not isinstance(manifest.get("limitations"), list) or not manifest[
+        "limitations"
+    ]:
+        raise ValueError("training manifest limitations are missing")
+
     entries = manifest.get("entries")
     if not isinstance(entries, list) or not all(
         isinstance(entry, Mapping) for entry in entries
@@ -1689,61 +2214,47 @@ def _validate_training_manifest(
     required_fields = {
         "path",
         "size_bytes",
-        "sha256",
+        "file_sha256",
         "row_count",
-        "schema",
-        "producer_command",
-        "input_hashes",
-        "base_model_id",
-        "base_model_revision",
-        "tokenizer_revision",
-        "training_source_sha256",
-        "scoring_source_sha256",
-        "evaluation_source_sha256",
-        "training_config_sha256",
-        "scoring_config_sha256",
-        "evaluation_config_sha256",
-        "packaging_config_sha256",
-        "training_fingerprint",
-        "regime_id",
-        "pair_file_sha256",
-        "pair_manifest_section_sha256",
-        "pair_count",
-        "usable_query_count",
-        "last_window_query_count",
-        "token_cache_bytes",
-        "token_cache_representation",
-        "git_commit",
-        "git_dirty",
-        "python_version",
-        "torch_version",
-        "transformers_version",
-        "tokenizers_version",
-        "cuda_version",
-        "gpu",
-        "seeds",
-        "optimizer",
-        "scheduler",
-        "optimizer_steps",
-        "throughput",
-        "validation_history",
-        "peak_rss_bytes",
-        "peak_gpu_memory_bytes",
-        "timestamps",
+        "parquet_schema",
+        "producer",
+        "input_file_sha256",
+        "implementation_source_sha256",
+        "configuration_sha256",
+        "run_provenance",
     }
     for entry, relative in zip(entries, expected_paths, strict=True):
         missing = required_fields.difference(entry)
         if missing:
-            raise ValueError(f"training manifest entry is missing fields: {sorted(missing)}")
+            raise ValueError(
+                f"training manifest entry is missing fields: {sorted(missing)}"
+            )
         source = repository_root(config) / relative
         if (
             entry["size_bytes"] != source.stat().st_size
-            or entry["sha256"] != sha256_file(source)
-            or re.fullmatch(r"[0-9a-f]{64}", str(entry["sha256"])) is None
+            or entry["file_sha256"] != sha256_file(source)
+            or re.fullmatch(r"[0-9a-f]{64}", str(entry["file_sha256"])) is None
             or entry["row_count"] != _row_count(source)
-            or entry["schema"] != _schema_json(source)
+            or entry["parquet_schema"] != _schema_json(source)
         ):
             raise ValueError(f"training manifest metadata mismatch: {relative}")
+        producer = _artifact_producer(
+            relative,
+            selected_run_id=str(manifest["model"]["selected_run_id"]),
+        )
+        if entry["producer"] != producer:
+            raise ValueError(f"training manifest producer mismatch: {relative}")
+        observed_runs = [
+            value.get("run_id") for value in entry["run_provenance"]
+        ]
+        if observed_runs != producer["run_ids"]:
+            raise ValueError(f"training manifest run provenance mismatch: {relative}")
+
+    entries_by_path = {entry["path"]: entry for entry in entries}
+    for run_id in ("A1", "A2", "B1"):
+        history = entries_by_path[f"reports/training/{run_id}_history.json"]
+        if [item["run_id"] for item in history["run_provenance"]] != [run_id]:
+            raise ValueError(f"{run_id} history has another run provenance")
 
 
 def _safe_members(names: Sequence[str]) -> None:
@@ -1866,10 +2377,10 @@ def _validate_zip(
             entry = entries.get(name)
             if (
                 entry is None
-                or entry["sha256"] != sha256_file(source)
+                or entry["file_sha256"] != sha256_file(source)
                 or entry["size_bytes"] != source.stat().st_size
                 or entry["row_count"] != _row_count(source)
-                or entry["schema"] != _schema_json(source)
+                or entry["parquet_schema"] != _schema_json(source)
             ):
                 raise ValueError(f"manifest payload mismatch: {name}")
     return {
@@ -1926,6 +2437,26 @@ def package_phase3(
     )
     _validate_selected_training_contract(config, selection)
     immutable = phase12_immutable_snapshot(config, require_all=True)
+    freeze_path = resolve_path(config, config["audits"]["environment_freeze"])
+    freeze_path.parent.mkdir(parents=True, exist_ok=True)
+    installed = sorted(
+        {
+            f"{str(distribution.metadata.get('Name') or '').strip().lower().replace('_', '-')}"
+            f"=={distribution.version}"
+            for distribution in importlib.metadata.distributions()
+            if str(distribution.metadata.get("Name") or "").strip()
+        }
+    )
+    freeze_text = (
+        "# Нормализованный pip freeze без локальных путей и editable-ссылок.\n"
+        + "\n".join(installed)
+        + "\n"
+    )
+    temporary_freeze = freeze_path.with_name(
+        f"{freeze_path.name}.tmp.{os.getpid()}"
+    )
+    temporary_freeze.write_text(freeze_text, encoding="utf-8")
+    temporary_freeze.replace(freeze_path)
     protocol_path = resolve_path(config, config["audits"]["protocol_snapshot"])
     config_path = Path(str(config["_config_path"]))
     protocol_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1967,8 +2498,16 @@ def package_phase3(
             "package-phase3/model", "best_finetuned differs from selection"
         )
     model_card = resolve_path(config, config["audits"]["model_card"])
+    release_sources = {
+        "LICENSE": resolve_path(config, config["release"]["license_file"]),
+        "NOTICE": resolve_path(config, config["release"]["notice_file"]),
+    }
     model_sources = {
-        name: (model_card if name == "model_card.md" else model_dir / name)
+        name: (
+            model_card
+            if name == "model_card.md"
+            else release_sources.get(name, model_dir / name)
+        )
         for name in MODEL_ZIP_MEMBERS
     }
     missing = [name for name, source in model_sources.items() if not source.is_file()]

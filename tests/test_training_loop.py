@@ -18,6 +18,7 @@ from rusearchrank.training import (
     build_training_fingerprint,
     disk_preflight,
     epoch_query_order,
+    estimate_steady_state_resources,
     finalize_run,
     load_resume_state,
     pairwise_logistic_loss,
@@ -91,6 +92,76 @@ def test_gradient_accumulation_uses_actual_16_and_1_query_window_means() -> None
     assert report["last_window_query_count"] == 1
     assert report["seen_query_ids"] == query_ids
     assert [len(window) for window in accumulation_windows(query_ids, 16)] == [16, 1]
+
+
+def test_resource_estimator_uses_only_full_steps_after_warmup() -> None:
+    measurements = [
+        {
+            "optimizer_step": 1,
+            "window_query_count": 16,
+            "pair_count": 160,
+            "seconds": 0.1,
+        },
+        *[
+            {
+                "optimizer_step": step,
+                "window_query_count": 16,
+                "pair_count": 160,
+                "seconds": 2.0,
+            }
+            for step in (2, 3, 4)
+        ],
+    ]
+    report = estimate_steady_state_resources(
+        measurements,
+        run_pair_counts={"A1": 800},
+        run_epochs={"A1": 3},
+        validation_pair_count=100,
+        validation_pairs_per_second=50.0,
+    )
+    assert report["status"] == "PASS"
+    assert report["steady_state_pairs_per_second"] == pytest.approx(80.0)
+    assert report["estimator"]["warmup_steps_excluded"] == 1
+    assert report["estimator"]["steady_steps_used"] == 3
+    assert report["estimated_training_time_range_seconds"]["A1"] == [28, 51]
+
+
+@pytest.mark.parametrize(
+    "measurements",
+    [
+        [
+            {
+                "optimizer_step": step,
+                "window_query_count": 16,
+                "pair_count": 160,
+                "seconds": 2.0,
+            }
+            for step in (1, 2, 3)
+        ],
+        [
+            {
+                "optimizer_step": step,
+                "window_query_count": 8 if step == 4 else 16,
+                "pair_count": 80 if step == 4 else 160,
+                "seconds": 2.0,
+            }
+            for step in (1, 2, 3, 4)
+        ],
+    ],
+)
+def test_resource_estimator_refuses_insufficient_steady_state_evidence(
+    measurements: list[dict[str, object]],
+) -> None:
+    report = estimate_steady_state_resources(
+        measurements,
+        run_pair_counts={"B1": 1600},
+        run_epochs={"B1": 3},
+        validation_pair_count=100,
+        validation_pairs_per_second=50.0,
+    )
+    assert report["status"] == "estimate_unreliable_due_to_smoke_overhead"
+    assert report["steady_state_pairs_per_second"] is None
+    assert report["estimated_training_time_range_seconds"]["B1"] is None
 
 
 def test_16_separate_backward_calls_equal_one_summed_objective() -> None:

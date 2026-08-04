@@ -41,6 +41,7 @@ from .evaluation import raw_score_tie_statistics
 from .pair_encoding import build_document as format_document
 from .pair_encoding import encode_pair
 from .retrieval import read_trec_run, validate_top_k
+from .trec_eval import resolve_trec_eval_executable
 
 
 DEFAULT_RERANK_CONFIG = Path("configs/rerank.yaml")
@@ -500,7 +501,7 @@ def validate_rerank_config(config: Mapping[str, Any]) -> dict[str, Any]:
         evaluation["trec_eval_provenance_path"],
     ]
     for raw in configured_values:
-        # The diagnostic run path is a literal portable template.
+    # The diagnostic run path is a literal portable template.
         candidate = resolve_path(config, str(raw).replace("{depth}", "10"))
         portable_path(config, candidate)
 
@@ -685,10 +686,10 @@ def scoring_source_sha256(
     details: dict[str, Any] = {
         "algorithm": "exact_top_level_source_fragments_with_frozen_io_contract_v2",
         "source_symbols": source_hashes,
-        # Phase 3 moves the byte-verified pair encoder into pair_encoding.py and
-        # adds an opt-in local checkpoint.  With checkpoint=None the frozen
-        # Phase 2 scoring semantics remain identical, so these default-path
-        # contracts intentionally replace source-location-sensitive fragments.
+    # Phase 3 moves the byte-verified pair encoder into pair_encoding.py and
+    # adds an opt-in local checkpoint.  With checkpoint=None the frozen
+    # Phase 2 scoring semantics remain identical, so these default-path
+    # contracts intentionally replace source-location-sensitive fragments.
         "frozen_default_path_contracts": {
             "pair_encoding": "golden_64_query_document_only_second_v1",
             "model_source": "pinned_hub_revision_when_checkpoint_is_none_v1",
@@ -910,7 +911,7 @@ def fingerprint_components(
         "scoring_source_sha256": scoring_hash,
         "scoring_config_sha256": scoring_details["scoring_config_sha256"],
         "evaluation_source_sha256": evaluation_hash,
-        # Compatibility alias for pre-audit reports; it is not load-bearing for scores.
+    # Compatibility alias for pre-audit reports; it is not load-bearing for scores.
         "source_tree_sha256": evaluation_hash,
         "git_commit": git_commit,
         "git_dirty": git_dirty,
@@ -1882,7 +1883,7 @@ def run_rerank_scoring(
         "row_count": final_validation["row_count"],
         "expected_key_set_sha256": final_validation["expected_key_set_sha256"],
         "scores_sha256": sha256_file(score_path),
-        # Alias retained so final validation can use the exact shard checks too.
+    # Alias retained so final validation can use the exact shard checks too.
         "shard_sha256": sha256_file(score_path),
         "schema_json": score_schema_json(),
         "created_at": utc_now(),
@@ -2192,17 +2193,11 @@ def build_rerank_run(
 
 
 def resolve_trec_eval(config: Mapping[str, Any]) -> Path:
-    configured = str(config["evaluation"]["trec_eval_executable"])
-    if Path(configured).is_absolute() or "/" in configured:
-        executable = resolve_path(config, configured)
-    else:
-        located = shutil.which(configured)
-        if located is None:
-            raise ValueError("official NIST trec_eval executable was not found on PATH")
-        executable = Path(located).resolve()
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise ValueError(f"trec_eval is not an executable file: {executable}")
-    return executable
+    return resolve_trec_eval_executable(
+        cli_path=config.get("_trec_eval_cli_path"),
+        configured_path=config["evaluation"].get("trec_eval_executable"),
+        repository_root=repository_root(config),
+    )
 
 
 def parse_trec_eval_version(stdout: str, stderr: str = "") -> str | None:
@@ -2538,8 +2533,8 @@ def smoke_expected_fields(config: Mapping[str, Any]) -> dict[str, Any]:
         **scoring_expected_fields(config),
         "config_sha256": sha256_file(Path(str(config["_config_path"]))),
         "evaluation_source_sha256": evaluation_hash,
-        # Backward-compatible full-tree alias; smoke validation does not use it
-        # to decide whether logits may be reused.
+    # Backward-compatible full-tree alias; smoke validation does not use it
+    # to decide whether logits may be reused.
         "source_tree_sha256": evaluation_hash,
     }
 

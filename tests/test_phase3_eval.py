@@ -180,33 +180,82 @@ def test_dev_ledger_is_append_only_and_marks_repeat_checkpoint(tmp_path: Path) -
     config = {
         "_config_path": str(config_path),
         "paths": {"repository_root": ".."},
-        "audits": {"dev_access_ledger": "reports/audit/ledger.jsonl"},
+        "audits": {
+            "dev_access_ledger": "reports/audit/ledger.jsonl",
+            "checkpoint_selection": "reports/audit/selection.json",
+        },
     }
+    selection = {
+        "schema_version": 2,
+        "selection_written_before_dev_access": True,
+        "selected_at": "2020-01-01T00:00:00+00:00",
+        "best_finetuned_checkpoint": {"sha256": "a" * 64},
+    }
+    selection["selection_sha256"] = phase3_eval_module._selection_payload_sha256(
+        selection
+    )
+    selection_path = tmp_path / "reports/audit/selection.json"
+    selection_path.parent.mkdir(parents=True)
+    selection_path.write_text(json.dumps(selection) + "\n", encoding="utf-8")
+    inputs = {"qrels": "c" * 64}
     first = append_dev_access_ledger(
         config,
         command="prepare-dev-evaluation",
         checkpoint_sha256="a" * 64,
-        input_hashes={"qrels": "declared"},
+        input_hashes=inputs,
     )
     second = append_dev_access_ledger(
         config,
         command="score-finetuned",
         checkpoint_sha256="a" * 64,
-        input_hashes={"candidates": "declared"},
-    )
-    third = append_dev_access_ledger(
-        config,
-        command="score-finetuned",
-        checkpoint_sha256="b" * 64,
-        input_hashes={},
+        input_hashes=inputs,
     )
     assert first["repeat_access"] is False
     assert second["repeat_access"] is True
-    assert third["repeat_access"] is False
     ledger = tmp_path / "reports/audit/ledger.jsonl"
     lines = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
-    assert len(lines) == 3
-    assert {line["checkpoint_sha256"] for line in lines} == {"a" * 64, "b" * 64}
+    assert len(lines) == 2
+    assert lines[0]["sequence"] == 1
+    assert lines[0]["previous_event_sha256"] == "0" * 64
+    assert lines[1]["sequence"] == 2
+    assert lines[1]["previous_event_sha256"] == lines[0]["event_sha256"]
+
+    with pytest.raises(StageError, match="different from the selection"):
+        append_dev_access_ledger(
+            config,
+            command="score-finetuned",
+            checkpoint_sha256="b" * 64,
+            input_hashes=inputs,
+        )
+    with pytest.raises(StageError, match="input declarations changed"):
+        append_dev_access_ledger(
+            config,
+            command="score-finetuned",
+            checkpoint_sha256="a" * 64,
+            input_hashes={"qrels": "d" * 64},
+        )
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_dev_ledger_refuses_access_before_selection(tmp_path: Path) -> None:
+    config_path = tmp_path / "configs/finetune.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("fixture: true\n", encoding="utf-8")
+    config = {
+        "_config_path": str(config_path),
+        "paths": {"repository_root": ".."},
+        "audits": {
+            "dev_access_ledger": "reports/audit/ledger.jsonl",
+            "checkpoint_selection": "reports/audit/selection.json",
+        },
+    }
+    with pytest.raises(StageError, match="selection must exist"):
+        append_dev_access_ledger(
+            config,
+            command="prepare-dev-evaluation",
+            checkpoint_sha256="a" * 64,
+            input_hashes={"qrels": "c" * 64},
+        )
 
 
 def _temporary_config(tmp_path: Path) -> dict[str, object]:
@@ -301,6 +350,8 @@ def test_selection_separates_best_finetuned_from_zero_shot_production(
     assert report["best_finetuned_checkpoint"]["epoch"] == 1
     assert report["production_system"]["kind"] == "zero_shot"
     assert report["zero_shot_won"] is True
+    assert report["schema_version"] == 2
+    assert len(report["selection_sha256"]) == 64
     assert "production_dir" not in config["artifacts"]
 
 

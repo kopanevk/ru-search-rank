@@ -99,7 +99,8 @@ audits:
   manifest: reports/audit/candidate_cache_manifest.json
 
 reproduction_gate:
-  trec_eval_executable: trec_eval
+  # null: разрешать через TREC_EVAL_PATH, затем через PATH.
+  trec_eval_executable: null
   trec_eval_version: "9.0.8"
   trec_eval_source: https://github.com/usnistgov/trec_eval/tree/v9.0.8
   official_topic: miracl-v1.0-ru-dev

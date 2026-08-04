@@ -3,6 +3,7 @@ implementation:
   score_schema_version: 1
   source_files:
     - src/rusearchrank/rerank.py
+    - src/rusearchrank/trec_eval.py
     - src/rusearchrank/cli.py
     - src/rusearchrank/evaluation.py
     - configs/rerank.yaml
@@ -70,7 +71,8 @@ audits:
   smoke: reports/audit/rerank_smoke.json
 
 evaluation:
-  trec_eval_executable: /opt/bin/trec_eval
+  # null: разрешать через TREC_EVAL_PATH, затем через PATH.
+  trec_eval_executable: null
   trec_eval_expected_release: "9.0.8"
   trec_eval_expected_source_tag: "v9.0.8"
   trec_eval_expected_source_commit: d95ca64e14a47d763ae349fb65e6d8cde4141dbd

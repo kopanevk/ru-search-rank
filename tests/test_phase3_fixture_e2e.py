@@ -211,6 +211,10 @@ def _full_fixture(tmp_path: Path) -> tuple[Path, dict[str, object], pd.DataFrame
         "src/rusearchrank/rerank.py",
         "src/rusearchrank/evaluation.py",
         "src/rusearchrank/phase3_eval.py",
+        "src/rusearchrank/trec_eval.py",
+        "LICENSE",
+        "NOTICE",
+        "requirements/kaggle.lock",
     ):
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -733,19 +737,56 @@ def test_full_phase3_stub_pipeline_packages_exact_payloads_and_preserves_inputs(
         manifest_paths = [entry["path"] for entry in manifest["entries"]]
         assert "reports/audit/training_manifest.json" not in manifest_paths
         assert manifest["self_reference"] is False
+        assert manifest["schema"] == {
+            "name": "rusearchrank.phase3.training_manifest",
+            "version": 2,
+        }
+        assert manifest["release"]["version"] == "1.0.1"
+        assert manifest["release"]["ref"] == "phase3-v1.0.1"
+        assert manifest["environment"]["lock_file_sha256"] == sha256_file(
+            tmp_path / "requirements/kaggle.lock"
+        )
+        assert manifest["licensing"]["license_file_sha256"] == sha256_file(
+            tmp_path / "LICENSE"
+        )
+        entries = {entry["path"]: entry for entry in manifest["entries"]}
+        for run_id in ("A1", "A2", "B1"):
+            history = entries[f"reports/training/{run_id}_history.json"]
+            assert [
+                provenance["run_id"]
+                for provenance in history["run_provenance"]
+            ] == [run_id]
+            assert history["file_sha256"] == sha256_file(
+                tmp_path / f"reports/training/{run_id}_history.json"
+            )
+
+        def assert_no_absolute_paths(value):  # type: ignore[no-untyped-def]
+            if isinstance(value, dict):
+                for nested in value.values():
+                    assert_no_absolute_paths(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    assert_no_absolute_paths(nested)
+            elif isinstance(value, str) and (value.startswith("/") or ":\\" in value):
+                raise AssertionError(f"absolute path in manifest: {value}")
+
+        assert_no_absolute_paths(manifest)
         for name in archive.namelist():
             assert archive.read(name) == (tmp_path / name).read_bytes()
     with zipfile.ZipFile(model_zip) as archive:
         assert archive.namelist() == list(phase3_eval_module.MODEL_ZIP_MEMBERS)
         for name in archive.namelist():
-            source = (
-                resolve_path(config, config["audits"]["model_card"])
-                if name == "model_card.md"
-                else resolve_path(
-                    config, config["artifacts"]["best_finetuned_dir"]
+            if name == "model_card.md":
+                source = resolve_path(config, config["audits"]["model_card"])
+            elif name in {"LICENSE", "NOTICE"}:
+                source = tmp_path / name
+            else:
+                source = (
+                    resolve_path(
+                        config, config["artifacts"]["best_finetuned_dir"]
+                    )
+                    / name
                 )
-                / name
-            )
             assert archive.read(name) == source.read_bytes()
     assert resolve_path(
         config, config["audits"]["protocol_snapshot"]
