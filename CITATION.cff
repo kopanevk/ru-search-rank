@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "Если RuSearchRank оказался полезен, процитируйте этот репозиторий."
+title: "RuSearchRank: проверяемое ранжирование русскоязычных документов"
+type: software
+authors:
+  - family-names: "Kopanev"
+    given-names: "Kirill"
+repository-code: "https://github.com/kopanevk/ru-search-rank"
+url: "https://github.com/kopanevk/ru-search-rank"
+license: MIT
+version: 1.0.1
+keywords:
+  - information retrieval
+  - Russian
+  - MIRACL
+  - BM25
+  - cross-encoder

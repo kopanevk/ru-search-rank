@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static, offline validation for the frozen Phase 3 Colab protocol."""
+"""Статическая проверка канонического production notebook этапа 3."""
 
 from __future__ import annotations
 
@@ -8,15 +8,20 @@ import json
 from pathlib import Path
 import re
 import sys
+from typing import Any
 
 import yaml
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-NOTEBOOK = REPOSITORY / "scripts/run_finetune.ipynb"
+NOTEBOOK = REPOSITORY / "scripts/run_finetune_kaggle.ipynb"
 CONFIG = REPOSITORY / "configs/finetune.yaml"
-SOURCE_TREE = REPOSITORY / "src"
-EXPECTED_CELLS = 19
+LOCK = REPOSITORY / "requirements/kaggle.lock"
+EXPECTED_STAGES = 24
+EXPECTED_CELLS = 47
+TRAIN_QRELS_SHA256 = (
+    "bf1f737cda0d66bc38fef5f9d91843f7a89428c5c5a8a3dce4764f527ec344ef"
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -24,259 +29,246 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def cell_source(cell: dict[str, Any]) -> str:
+    source = cell.get("source", [])
+    require(isinstance(source, list), "cell source must be a list")
+    return "".join(str(line) for line in source)
+
+
 def main() -> int:
+    require(NOTEBOOK.is_file(), f"не найден notebook: {NOTEBOOK}")
     notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     cells = notebook.get("cells")
     require(
         isinstance(cells, list) and len(cells) == EXPECTED_CELLS,
-        f"Phase 3 notebook must contain exactly {EXPECTED_CELLS} cells",
+        f"ожидалось {EXPECTED_CELLS} ячеек",
     )
-    require(cells[0].get("cell_type") == "markdown", "Cell 1 must be markdown")
-    sources = ["".join(cell.get("source", [])) for cell in cells]
-    for number, cell in enumerate(cells[1:], start=2):
-        require(cell.get("cell_type") == "code", f"Cell {number} must be code")
-        require(cell.get("execution_count") is None, f"Cell {number} has execution_count")
-        require(not cell.get("outputs"), f"Cell {number} contains saved outputs")
-        ast.parse(sources[number - 1], filename=f"Cell {number}")
 
-    required_by_cell = {
-        1: [
-            "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-            "1427fd652930e4ba29e8149678df786c240d8825",
-            "Colab-GPU-only",
-        ],
-        2: [
-            "platform.system() != 'Linux'",
-            "nvidia-smi",
-            "MIN_FREE_GIB",
-            "MIN_RAM_GIB",
-            "available_ram",
-        ],
-        3: [
-            "BRANCH = 'phase-3'",
-            "ALLOW_OVERWRITE_PHASE3 = False",
-            "RESUME_TRAINING = True",
-            "def run_checked(",
-            "def training_options(",
-            "return code",
-            "complete log",
-            "git', 'pull', '--ff-only'",
-        ],
-        4: [
-            "openjdk-21-jdk-headless",
-            "TREC_EVAL_TAG = 'v9.0.8'",
-            "TREC_EVAL_COMMIT = 'd95ca64e14a47d763ae349fb65e6d8cde4141dbd'",
-            "shutil.rmtree(TREC_EVAL_DIR)",
-            "'/opt/bin/trec_eval', '-v'",
-            "makefile_sha256_before",
-            "makefile_sha256_after",
-            "trec_eval_build_provenance.json",
-            "known_upstream_version_string_mismatch",
-            "'fresh_checkout': True",
-            "binary_sha256",
-        ],
-        5: [
-            "sys.version_info[:2] != (3, 12)",
-            "venv.EnvBuilder",
-            "pip', 'install', '-e', '.'",
-            "sentencepiece.bpe.model",
-            "torch.cuda.is_available()",
-        ],
-        6: [
-            "pytest', '-q'",
-            "validate_phase3_notebook.py",
-            "transformers.__version__",
-            "tokenizers.__version__",
-        ],
-        7: [
-            "PHASE1_ZIP",
-            "PHASE2_ZIP",
-            "archive.testzip()",
-            "archive.extractall",
-            "entry['sha256']",
-            "prepare-annotations",
-            "'--split', 'train'",
-        ],
-        8: [
-            "phase12_immutable_snapshot",
-            "verify_phase12_immutable",
-            "build-training-split",
-            "build-training-pairs",
-            "usable_query_count",
-            "population_disclosure",
-            "weight_disclosure",
-            "heuristic_disclosure",
-        ],
-        9: [
-            "validate-checkpoint",
-            "'base'",
-        ],
-        10: [
-            "smoke-finetune",
-            "real_model_forward",
-            "fixture_only",
-            "FINETUNE_SMOKE_PASSED = True",
-            "estimated_training_time_range_seconds",
-        ],
-        11: ["'finetune'", "'C1'", "BLOCKED_FOR_REVIEW"],
-        12: ["'finetune'", "'A1'"],
-        13: ["'finetune'", "'A2'"],
-        14: ["'finetune'", "'B1'"],
-        15: [
-            "select-checkpoint",
-            "checkpoint_selection.json",
-            "validation_ab_comparison.json",
-            "exploratory_post_selection_ab",
-        ],
-        16: ["prepare-dev-evaluation"],
-        17: ["score-finetuned"],
-        18: ["evaluate-phase3", "pipeline_status", "ml_outcome"],
-        19: [
-            "package-phase3",
-            "rusearchrank_phase3_results.zip",
-            "streaming_sha256",
-            "shutil.copy2",
-            "files.download",
-        ],
-    }
-    for number, fragments in required_by_cell.items():
-        for fragment in fragments:
-            require(fragment in sources[number - 1], f"Cell {number} is missing {fragment!r}")
+    sources = [cell_source(cell) for cell in cells]
+    stage_numbers: list[int] = []
+    for index, cell in enumerate(cells, start=1):
+        cell_type = cell.get("cell_type")
+        require(cell_type in {"markdown", "code"}, f"ячейка {index}: неверный тип")
+        if cell_type == "markdown":
+            match = re.match(r"^## Этап (\d+)\.", sources[index - 1])
+            require(match is not None, f"ячейка {index}: нет номера этапа")
+            stage_numbers.append(int(match.group(1)))
+            continue
+        require(
+            cell.get("execution_count") is None,
+            f"ячейка {index}: сохранён execution_count",
+        )
+        outputs = cell.get("outputs", [])
+        require(not outputs, f"ячейка {index}: сохранены outputs")
+        ast.parse(sources[index - 1], filename=f"ячейка {index}")
 
-    code = "\n".join(sources[1:])
-    for banned in ("load_dataset", "trust_remote_code", "pyserini.eval"):
-        require(banned not in code, f"notebook contains banned {banned!r}")
-    for banned_command in (
+    require(
+        stage_numbers == list(range(1, EXPECTED_STAGES + 1)),
+        "номера 24 этапов нарушены",
+    )
+    require(cells[0].get("cell_type") == "markdown", "этап 1 должен быть markdown")
+    for stage in range(2, EXPECTED_STAGES + 1):
+        markdown_index = 1 + (stage - 2) * 2
+        require(
+            cells[markdown_index].get("cell_type") == "markdown"
+            and cells[markdown_index + 1].get("cell_type") == "code",
+            f"этап {stage} должен состоять из markdown и code",
+        )
+
+    all_text = "\n".join(sources)
+    code_text = "\n".join(
+        source
+        for cell, source in zip(cells, sources, strict=True)
+        if cell.get("cell_type") == "code"
+    )
+    lower_text = all_text.lower()
+    require("traceback (most recent call last)" not in lower_text, "найден traceback")
+    for banned in (
+        "/opt/bin",
+        "/kaggle/working",
+        "git pull",
+        "openjdk",
+        "apt-get",
+        "filelink",
+        "google.colab",
+        "trust_remote_code",
+        "pip install -u",
+    ):
+        require(banned not in lower_text, f"найден запрещённый фрагмент {banned!r}")
+    require(re.search(r"/(?:Users|home)/", all_text) is None, "найден локальный путь пользователя")
+    require(
+        re.search(r"[A-Za-z]:\\\\", all_text) is None,
+        "найден абсолютный путь Windows",
+    )
+    require(re.search(r"\bBRANCH\s*=", code_text) is None, "используется плавающая ветка")
+    require(
+        re.search(
+            r"(?:api[_-]?key|access[_-]?token|hf_token|github_token)\s*=",
+            code_text,
+            flags=re.IGNORECASE,
+        )
+        is None,
+        "в notebook похожая на секрет переменная",
+    )
+
+    require(
+        re.search(r"RELEASE_REF\s*=\s*[\"']phase3-v\d+\.\d+\.\d+[\"']", code_text)
+        is not None,
+        "не указан неизменяемый тег выпуска",
+    )
+    require(code_text.count("def run_checked(") == 1, "run_checked определён не один раз")
+    require(
+        code_text.count('"select-checkpoint"') == 1,
+        "select-checkpoint должен встречаться ровно один раз",
+    )
+    require(
+        code_text.count('"package-phase3"') == 1,
+        "package-phase3 должен встречаться ровно один раз",
+    )
+    for forbidden_command in (
         "run-bm25",
         "build-candidate-cache",
         "rerank-score",
         "evaluate-rerank",
+        "package-phase1",
+        "package-phase2",
     ):
-        require(banned_command not in code, f"notebook attempts forbidden rebuild {banned_command}")
+        require(
+            forbidden_command not in code_text,
+            f"запрещён повторный запуск предыдущей фазы: {forbidden_command}",
+        )
 
-    ordered_commands = (
-        "smoke-finetune",
-        "'C1'",
-        "'A1'",
-        "'A2'",
-        "'B1'",
-        "select-checkpoint",
+    ordered = (
+        '"build-training-split"',
+        '"build-training-pairs"',
+        '"validate-checkpoint"',
+        '"smoke-finetune"',
+        '"C1"',
+        '"A1"',
+        '"A2"',
+        '"B1"',
+        '"select-checkpoint"',
+        '"prepare-dev-evaluation"',
+        '"score-finetuned"',
+        '"evaluate-phase3"',
+        '"package-phase3"',
+    )
+    positions = [code_text.index(fragment) for fragment in ordered]
+    require(positions == sorted(positions), "порядок production-команд нарушен")
+
+    stage_code: dict[int, str] = {}
+    for stage in range(2, EXPECTED_STAGES + 1):
+        stage_code[stage] = sources[2 + (stage - 2) * 2]
+    preselection = "\n".join(stage_code[stage] for stage in range(2, 19))
+    for forbidden in (
         "prepare-dev-evaluation",
         "score-finetuned",
         "evaluate-phase3",
-        "package-phase3",
-    )
-    positions = [code.index(fragment) for fragment in ordered_commands]
-    require(positions == sorted(positions), "Phase 3 command ordering changed")
-
-    # No source-evaluation annotation or scoring path may appear before selection.
-    preselection = "\n".join(sources[:14])
-    for forbidden in (
         "qrels.miracl-v1.0-ru-dev",
-        "dev_top100",
-        "dev_bm25",
-        "dev_rerank",
-        "dev_zeroshot",
-        "score-finetuned",
-        "evaluate-phase3",
+        "prepared_dev_qrels",
     ):
-        require(forbidden not in preselection, f"pre-selection cell exposes {forbidden!r}")
+        require(
+            forbidden not in preselection,
+            f"до выбора обнаружен доступ к dev: {forbidden}",
+        )
+
+    smoke_source = stage_code[14]
+    for fragment in (
+        '"status": "PASS"',
+        '"real_model_forward": True',
+        '"real_optimizer_step": True',
+        '"fixture_only": False',
+        '"device": "cuda"',
+        '"checkpoint_save_load_roundtrip": True',
+        '"resume_state_roundtrip": True',
+        '"zip_hash_roundtrip": True',
+        '"dtype"',
+        '"float32"',
+    ):
+        require(fragment in smoke_source, f"smoke gate не проверяет {fragment}")
+
+    preflight_source = stage_code[3]
+    require("MIN_FREE_DISK_GIB = 25" in preflight_source, "не объявлен порог диска")
+    require(
+        'disk.free < MIN_FREE_DISK_GIB * 1024**3' in preflight_source,
+        "порог диска не используется",
+    )
+    require("TREC_EVAL_PATH" in stage_code[5], "trec_eval не передаётся через окружение")
+    require(TRAIN_QRELS_SHA256 in code_text, "нет точной SHA-256 train qrels")
+    require("CUDA_VISIBLE_DEVICES" in stage_code[8], "нет отдельного CUDA-negative теста")
+    require(
+        "not test_unknown_run_and_non_cuda_production_are_blocked" in stage_code[8],
+        "основной pytest не исключает environment-specific CUDA-тест",
+    )
+    for version in ("3.12.13", "2.13.0", "5.14.1", "0.22.2"):
+        require(version in stage_code[6], f"окружение не фиксирует {version}")
+    require('"--no-deps"' in stage_code[6], "установка окружения не ограничена")
+    require('"--requirement"' in stage_code[6], "lock-файл не используется")
+    require("wrapt" not in lower_text, "найдена дублирующая установка wrapt")
+
+    mutation_patterns = (
+        r"(?:src|configs)/[^\n]*(?:write_text|write_bytes)",
+        r"(?:write_text|write_bytes)[^\n]*(?:src|configs)/",
+        r"sed\s+-i[^\n]*(?:src|configs)",
+        r"apply_patch",
+    )
+    for pattern in mutation_patterns:
+        require(
+            re.search(pattern, code_text, flags=re.IGNORECASE) is None,
+            "notebook изменяет src/ или configs/",
+        )
 
     config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-    exact = {
-        ("implementation", "version"): "3.0.0",
-        ("input", "max_length"): 320,
-        ("input", "truncation"): "only_second",
-        ("split", "seed"): 20260803,
-        ("split", "min_stratum_size"): 20,
-        ("training", "epochs"): 3,
-        ("training", "micro_batch_queries"): 1,
-        ("training", "grad_accumulation"): 16,
-        ("training", "precision"): "fp32",
-        ("training", "device"): "cuda",
-        ("training", "token_cache"): "pretokenized_flat_int32",
-    }
-    for (section, key), expected in exact.items():
-        require(config[section][key] == expected, f"{section}.{key} changed")
-    for key in ("revision", "tokenizer_revision"):
-        require(
-            re.fullmatch(r"[0-9a-f]{40}", str(config["base_model"][key])) is not None,
-            f"base_model.{key} must be an immutable SHA",
-        )
+    require(config["implementation"]["version"] == "3.1.0", "неверная версия реализации")
+    require(config["release"]["version"] == "1.0.1", "неверная версия выпуска")
+    require(config["release"]["ref"] == "phase3-v1.0.1", "неверный тег выпуска")
     require(
-        {config["runs"]["A1"]["learning_rate"], config["runs"]["A2"]["learning_rate"]}
-        == {7.0e-6, 2.0e-5},
-        "judged-only LR set changed",
-    )
-    golden = json.loads(
-        (REPOSITORY / "tests/fixtures/pair_encoding_golden.json").read_text(encoding="utf-8")
-    )
-    require(len(golden.get("cases", [])) == 64, "encoding golden must contain 64 pairs")
-    require(
-        golden.get("model_id") == config["base_model"]["id"]
-        and golden.get("tokenizer_revision")
-        == config["base_model"]["tokenizer_revision"],
-        "config model/tokenizer revision differs from the encoding golden",
+        config["archive"]["results_zip"].endswith("_v1.0.1.zip"),
+        "имя архива результатов не версионировано",
     )
     require(
-        set(golden.get("tokenizer_payload_sha256", {}))
-        == {
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "sentencepiece.bpe.model",
-        }
-        and all(
-            re.fullmatch(r"[0-9a-f]{64}", str(value)) is not None
-            for value in golden["tokenizer_payload_sha256"].values()
-        ),
-        "encoding golden must bind the complete pinned tokenizer payload",
+        config["evaluation"]["reference_zero_shot_ndcg_at_10"] == 0.5365
+        and config["evaluation"]["reference_bm25_ndcg_at_10"] == 0.3342,
+        "изменены официальные опорные метрики",
+    )
+    rerank_config = yaml.safe_load(
+        (REPOSITORY / "configs/rerank.yaml").read_text(encoding="utf-8")
+    )
+    retrieval_config = yaml.safe_load(
+        (REPOSITORY / "configs/retrieval.yaml").read_text(encoding="utf-8")
+    )
+    require(
+        rerank_config["evaluation"]["trec_eval_executable"] is None,
+        "configs/rerank.yaml содержит жёсткий путь trec_eval",
+    )
+    require(
+        retrieval_config["reproduction_gate"]["trec_eval_executable"] is None,
+        "configs/retrieval.yaml содержит жёсткий путь trec_eval",
     )
 
-    forbidden_training_literals = {
-        "dev_top100",
-        "dev_bm25",
-        "dev_rerank",
-        "miracl-v1.0-ru-dev",
+    lock_lines = {
+        line.strip()
+        for line in LOCK.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
     }
-    for relative in (
-        Path("src/rusearchrank/training.py"),
-        Path("src/rusearchrank/training_data.py"),
+    for requirement in (
+        "torch==2.13.0",
+        "transformers==5.14.1",
+        "tokenizers==0.22.2",
     ):
-        tree = ast.parse((REPOSITORY / relative).read_text(encoding="utf-8"), filename=str(relative))
-        constants = {
-            node.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        }
-        require(
-            not constants.intersection(forbidden_training_literals),
-            f"{relative} contains a forbidden evaluation-path literal",
-        )
-
-    for module in sorted(SOURCE_TREE.rglob("*.py")):
-        relative = module.relative_to(REPOSITORY)
-        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(relative))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-                require(name != "load_dataset", f"{relative}:{node.lineno} calls load_dataset")
-                require(
-                    all(keyword.arg != "trust_remote_code" for keyword in node.keywords),
-                    f"{relative}:{node.lineno} enables remote code",
-                )
+        require(requirement in lock_lines, f"lock-файл не содержит {requirement}")
 
     print(
         json.dumps(
             {
                 "status": "PASS",
-                "notebook": str(NOTEBOOK.relative_to(REPOSITORY)),
+                "notebook": NOTEBOOK.relative_to(REPOSITORY).as_posix(),
                 "cells": len(cells),
-                "branch": "phase-3",
-                "smoke_cell": 10,
-                "control_cell": 11,
-                "selection_cell": 15,
-                "first_evaluation_access_cell": 16,
+                "stages": EXPECTED_STAGES,
+                "release_ref": config["release"]["ref"],
+                "selection_stage": 19,
+                "first_dev_access_stage": 20,
+                "package_stage": 23,
             },
             ensure_ascii=False,
             indent=2,
@@ -288,6 +280,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ValueError, KeyError, json.JSONDecodeError, SyntaxError) as exc:
-        print(f"Phase 3 notebook validation failed: {exc}", file=sys.stderr)
+    except (KeyError, OSError, ValueError, json.JSONDecodeError, SyntaxError) as exc:
+        print(f"Проверка production notebook не пройдена: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

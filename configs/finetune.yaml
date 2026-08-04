@@ -1,6 +1,15 @@
 implementation:
-  version: "3.0.0"
+  version: "3.1.0"
   score_schema_version: 1
+release:
+  version: "1.0.1"
+  manifest_schema_version: 2
+  archive_schema_version: 2
+  ref: phase3-v1.0.1
+  kaggle_python_version: "3.12.13"
+  environment_lock: requirements/kaggle.lock
+  license_file: LICENSE
+  notice_file: NOTICE
 base_model:
   id: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
   revision: 1427fd652930e4ba29e8149678df786c240d8825
@@ -145,6 +154,7 @@ audits:
   model_card: reports/audit/model_card.md
   control_report: reports/audit/control_c1.json
   resource_report: reports/audit/resource_report.json
+  environment_freeze: reports/audit/environment_freeze.txt
 metrics:
   training_history_template: reports/training/{run_id}_history.json
   validation_checkpoint_metrics: reports/metrics/validation_checkpoint_metrics.json
@@ -153,8 +163,8 @@ metrics:
   three_way: reports/metrics/dev_three_way_comparison.json
   tie_diagnostic: reports/metrics/dev_score_tie_diagnostic.json
 archive:
-  results_zip: artifacts/rusearchrank_phase3_results.zip
-  model_zip_template: artifacts/rusearchrank_phase3_model_{run_id}.zip
+  results_zip: artifacts/rusearchrank_phase3_results_v1.0.1.zip
+  model_zip_template: artifacts/rusearchrank_phase3_model_{run_id}_v1.0.1.zip
 paths:
   repository_root: ..
   work_dir: artifacts/work/phase3

@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 import rusearchrank.cli as cli_module
+import rusearchrank.trec_eval as trec_eval_module
 import shard_fixtures
 from rusearchrank.cli import main
 from rusearchrank.data import extract_passages_from_rows
@@ -398,8 +399,8 @@ def test_missing_trec_eval_is_a_clear_preflight_error(
         "paths": {"repository_root": "."},
         "reproduction_gate": {"trec_eval_executable": "trec_eval"},
     }
-    monkeypatch.setattr(cli_module.shutil, "which", lambda executable: None)
-    with pytest.raises(ValueError, match="was not found on PATH"):
+    monkeypatch.setattr(trec_eval_module.shutil, "which", lambda executable: None)
+    with pytest.raises(ValueError, match="trec_eval.*не найден"):
         cli_module._resolve_trec_eval_executable(config)
 
 

@@ -22,7 +22,7 @@ from .data import CANDIDATE_COLUMNS, validate_candidate_schema
 
 
 DEFAULT_FINETUNE_CONFIG = Path("configs/finetune.yaml")
-IMPLEMENTATION_VERSION = "3.0.0"
+IMPLEMENTATION_VERSION = "3.1.0"
 TRAIN_ROLE = "train_fit"
 VALIDATION_ROLE = "train_validation"
 PAIR_REGIMES = ("judged_only", "weak_negatives", "control_c1")
@@ -187,6 +187,16 @@ def validate_finetune_config(config: Mapping[str, Any]) -> None:
 
     expected_section_keys = {
         "implementation": {"version", "score_schema_version"},
+        "release": {
+            "version",
+            "manifest_schema_version",
+            "archive_schema_version",
+            "ref",
+            "kaggle_python_version",
+            "environment_lock",
+            "license_file",
+            "notice_file",
+        },
         "base_model": {"id", "revision", "tokenizer_revision"},
         "input": {"max_length", "truncation", "title_separator", "pair_order"},
         "split": {
@@ -311,6 +321,7 @@ def validate_finetune_config(config: Mapping[str, Any]) -> None:
             "model_card",
             "control_report",
             "resource_report",
+            "environment_freeze",
         },
         "metrics": {
             "training_history_template",
@@ -360,6 +371,14 @@ def validate_finetune_config(config: Mapping[str, Any]) -> None:
     exact_values = {
         "implementation.version": IMPLEMENTATION_VERSION,
         "implementation.score_schema_version": 1,
+        "release.version": "1.0.1",
+        "release.manifest_schema_version": 2,
+        "release.archive_schema_version": 2,
+        "release.ref": "phase3-v1.0.1",
+        "release.kaggle_python_version": "3.12.13",
+        "release.environment_lock": "requirements/kaggle.lock",
+        "release.license_file": "LICENSE",
+        "release.notice_file": "NOTICE",
         "base_model.id": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
         "base_model.revision": "1427fd652930e4ba29e8149678df786c240d8825",
         "base_model.tokenizer_revision": "1427fd652930e4ba29e8149678df786c240d8825",
@@ -451,6 +470,10 @@ def validate_finetune_config(config: Mapping[str, Any]) -> None:
         "protocol.trec_score_encoding": "rank_preserving",
         "protocol.trec_score_base": 1_000_000,
         "protocol.trec_score_format": "%.4f",
+        "archive.results_zip": "artifacts/rusearchrank_phase3_results_v1.0.1.zip",
+        "archive.model_zip_template": (
+            "artifacts/rusearchrank_phase3_model_{run_id}_v1.0.1.zip"
+        ),
     }
     for dotted, expected in exact_values.items():
         _exact(config, dotted, expected)
@@ -481,6 +504,8 @@ def validate_finetune_config(config: Mapping[str, Any]) -> None:
         for raw in values.values():
             candidate = str(raw).replace("{run_id}", "A1")
             portable_path(config, resolve_path(config, candidate))
+    for key in ("environment_lock", "license_file", "notice_file"):
+        portable_path(config, resolve_path(config, str(config["release"][key])))
 
 
 def load_finetune_config(path: str | Path = DEFAULT_FINETUNE_CONFIG) -> dict[str, Any]:
@@ -1034,8 +1059,8 @@ def _round_robin_pairs(
         for positive in positive_order:
             if len(selected) >= target:
                 break
-            # One source-aware global round-robin.  Judged is the fixed priority
-            # whenever both capacities remain; weak fills in the same round.
+    # Один общий циклический обход сохраняет приоритет экспертной разметки,
+    # а слабые примеры заполняют оставшиеся места в том же круге.
             if take_from("judged_non_relevant", positive):
                 progress = True
                 continue
@@ -1272,16 +1297,17 @@ def build_pair_frame(
             "passed": True,
         },
         "population_disclosure": (
-            "judged_only and weak_negatives use different query populations; the weak "
-            "regime includes positive queries without judged negatives"
+            "judged_only и weak_negatives охватывают разные множества запросов; "
+            "режим со слабыми примерами включает положительные запросы без "
+            "экспертно оценённых отрицательных документов"
         ),
         "weight_disclosure": (
-            "weight 0.5 reduces one weak pair's influence but does not fix the aggregate "
-            "weak share, which may range from 0% to 100% by query"
+            "вес 0,5 уменьшает влияние отдельной слабой пары, но не фиксирует их "
+            "суммарную долю: для отдельного запроса она может составлять от 0% до 100%"
         ),
         "heuristic_disclosure": (
-            "ranks 26-100, targets 3/3/2, weight 0.5, and caps 8/8/16 are "
-            "preregistered conservative heuristics, not dev-tuned optima"
+            "ранги 26–100, целевые числа 3/3/2, вес 0,5 и ограничения 8/8/16 — "
+            "заранее заданные консервативные эвристики, а не оптимумы по dev"
         ),
     }
     return output, section
@@ -1447,16 +1473,17 @@ def materialize_control_pairs(
             "passed": True,
         },
         "population_disclosure": (
-            "judged_only and weak_negatives use different query populations; the weak "
-            "regime includes positive queries without judged negatives"
+            "judged_only и weak_negatives охватывают разные множества запросов; "
+            "режим со слабыми примерами включает положительные запросы без "
+            "экспертно оценённых отрицательных документов"
         ),
         "weight_disclosure": (
-            "weight 0.5 reduces one weak pair's influence but does not fix the aggregate "
-            "weak share, which may range from 0% to 100% by query"
+            "вес 0,5 уменьшает влияние отдельной слабой пары, но не фиксирует их "
+            "суммарную долю: для отдельного запроса она может составлять от 0% до 100%"
         ),
         "heuristic_disclosure": (
-            "ranks 26-100, targets 3/3/2, weight 0.5, and caps 8/8/16 are "
-            "preregistered conservative heuristics, not dev-tuned optima"
+            "ранги 26–100, целевые числа 3/3/2, вес 0,5 и ограничения 8/8/16 — "
+            "заранее заданные консервативные эвристики, а не оптимумы по dev"
         ),
     }
     return output, section
@@ -1673,8 +1700,8 @@ def phase12_immutable_snapshot(
         for input_name, relative in direct_inputs.items():
             expected = entries.get(relative, entries.get(input_name))
             actual_path = resolve_path(config, relative)
-            # Direct train-side files may be checked byte-for-byte now. Isolated
-            # evaluation payloads remain unopened until the guarded stage.
+            # Обучающие файлы можно сверить побайтно сразу; изолированные данные
+            # оценивания остаются закрытыми до защищённой стадии.
             if (
                 expected is not None
                 and actual_path.is_file()

@@ -1,4 +1,4 @@
-"""Phase 0 checks and the guarded Linux/Colab Phase 1A command line."""
+"""Проверки и защищённый CLI этапов RuSearchRank."""
 
 from __future__ import annotations
 
@@ -83,6 +83,7 @@ from .retrieval import (
     validate_top_k,
     write_trec_run,
 )
+from .trec_eval import resolve_trec_eval_executable
 
 
 DEFAULT_CHECKPOINT = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
@@ -151,6 +152,15 @@ def _load_retrieval_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"retrieval config is missing sections: {', '.join(missing)}")
     payload["_config_path"] = str(config_path)
     return payload
+
+
+def _apply_trec_eval_cli_override(
+    config: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    override = getattr(args, "trec_eval_path", None)
+    if override is not None:
+        config["_trec_eval_cli_path"] = str(override)
+    return config
 
 
 def _repository_root(config: dict[str, Any]) -> Path:
@@ -324,7 +334,7 @@ def _corpus_settings(config: dict[str, Any]) -> dict[str, Any]:
 def _corpus_source(config: dict[str, Any]) -> ShardSource:
     settings = _corpus_settings(config)
     if settings["local_dir"] is not None:
-        # Explicit offline override for already-materialized official shards.
+        # Явно разрешаем использовать уже подготовленные официальные сегменты без сети.
         return LocalShardSource(
             language=settings["language"],
             shard_count=settings["shard_count"],
@@ -923,7 +933,7 @@ def _inspect_checkpoint(args: argparse.Namespace) -> int:
                         for pair, score in zip(pairs, mps_scores, strict=True)
                     },
                 }
-            except Exception as exc:  # The failure is preserved in the audit artifact.
+            except Exception as exc:  # Сведения о сбое сохраняются в отчёте проверки.
                 report["mps_smoke"] = {
                     "available": True,
                     "status": "failed",
@@ -1304,11 +1314,13 @@ def _preflight_command(args: argparse.Namespace) -> int:
     if args.stage == "rerank":
         if args.check_index:
             raise ValueError("--check-index is only valid for retrieval preflight")
-        rerank_config = rerank_module.load_rerank_config(args.config)
+        rerank_config = _apply_trec_eval_cli_override(
+            rerank_module.load_rerank_config(args.config), args
+        )
         report = rerank_module.preflight_rerank(rerank_config)
         _print_json({"status": "PASS", "preflight": report})
         return 0
-    config = _load_retrieval_config(args.config)
+    config = _apply_trec_eval_cli_override(_load_retrieval_config(args.config), args)
     if args.stage == "retrieval":
         report = _preflight_retrieval(config, check_index=args.check_index)
     elif args.stage == "candidate-cache":
@@ -1671,7 +1683,7 @@ def _run_bm25(args: argparse.Namespace) -> int:
                 + _portable_repository_path(config, temporary)
             )
         validate_query_coverage(validated, queries)
-        # Preserve Pyserini's raw output byte-for-byte for official evaluation.
+        # Исходная выдача Pyserini сохраняется побайтно для официального оценивания.
         with temporary.open("rb") as stream:
             os.fsync(stream.fileno())
         temporary.replace(target)
@@ -2111,8 +2123,8 @@ def _build_candidate_cache(args: argparse.Namespace) -> int:
     _atomic_parquet(candidate_frames["dev"], output_paths["dev_candidates"])
     _atomic_parquet(queries, output_paths["queries"])
     staging_passages.replace(output_paths["passages"])
-    # The passage table is validated row by row while it is written, so the
-    # published file only needs its docid column read back for exact coverage.
+    # Таблица проверяется построчно при записи, поэтому для точного покрытия
+    # из опубликованного файла достаточно повторно прочитать столбец docid.
     published = pq.read_table(output_paths["passages"], columns=["docid"])
     published_docids = set(published.column("docid").to_pylist())
     passage_count = published.num_rows
@@ -2239,7 +2251,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
                 language=settings["language"],
                 shard_count=settings["shard_count"],
             )
-        # 1. pinned revision availability, 3. no dataset script is ever executed
+        # 1. доступность ревизии; 3. сценарий набора данных не запускается
         record(
             "pinned_revision_available",
             {
@@ -2266,7 +2278,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
             {"first": names[:3], "last": names[-3:], "count": len(names)},
         )
 
-        # 2. first shard availability
+        # 2. доступность первого сегмента
         shard_name = names[int(args.shard_index)]
         shard_path = source.local_path(shard_name)
         record(
@@ -2278,7 +2290,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
             },
         )
 
-        # 4-7. real gzip open, valid JSON, required fields, string docid
+        # 4–7. открытие настоящего gzip, JSON, обязательные поля и строковый docid
         rows: list[dict[str, str]] = []
         max_rows = int(args.max_rows)
         stream = iter_shard_rows(shard_path, shard=shard_name, max_rows=max_rows)
@@ -2303,7 +2315,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
             },
         )
 
-        # 8. filter several real passages exactly like the candidate cache does
+        # 8. фильтрация документов тем же способом, что и для кеша кандидатов
         selected = [row["docid"] for row in rows[:: max(1, len(rows) // 25)]][:25]
         if len(selected) < min(25, len(rows)):
             selected = [row["docid"] for row in rows[:25]]
@@ -2331,7 +2343,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
             },
         )
 
-        # 9-10. real Parquet write and read back
+        # 9–10. запись настоящего Parquet и повторное чтение
         reloaded = pd.read_parquet(passages_path)
         validate_passages(reloaded)
         if set(reloaded["docid"].astype("string")) != requested:
@@ -2346,7 +2358,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
             },
         )
 
-        # 11. real manifest with sizes and hashes
+        # 11. настоящий манифест с размерами и контрольными суммами
         manifest_path = temporary_root / "smoke_manifest.json"
         passages_hash = _sha256(passages_path)
         manifest = {
@@ -2372,7 +2384,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
         _write_json(manifest_path, manifest)
         record("temporary_manifest", {"path": str(manifest_path), "entries": 1})
 
-        # 12-14. real ZIP, real extraction, real hash revalidation
+        # 12–14. создание ZIP, извлечение и повторная проверка контрольных сумм
         archive_path = temporary_root / "smoke_results.zip"
         members = [passages_path.name, manifest_path.name]
         with zipfile.ZipFile(
@@ -2435,7 +2447,7 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
         _write_json(report_path, payload)
         payload["report"] = _portable_repository_path(config, report_path)
         _print_json(payload)
-        # 15. cleanup only after a successful report
+        # 15. очистка только после успешного отчёта
         shutil.rmtree(temporary_root, ignore_errors=True)
         cleaned = True
         return 0
@@ -2449,22 +2461,11 @@ def _smoke_corpus_access(args: argparse.Namespace) -> int:
 
 
 def _resolve_trec_eval_executable(config: dict[str, Any]) -> Path:
-    configured = str(
-        config["reproduction_gate"].get("trec_eval_executable", "trec_eval")
+    return resolve_trec_eval_executable(
+        cli_path=config.get("_trec_eval_cli_path"),
+        configured_path=config["reproduction_gate"].get("trec_eval_executable"),
+        repository_root=_repository_root(config),
     )
-    if Path(configured).is_absolute() or "/" in configured:
-        candidate = _resolve_repository_path(config, configured)
-    else:
-        located = shutil.which(configured)
-        if located is None:
-            raise ValueError(
-                "official trec_eval binary was not found on PATH; install NIST "
-                "trec_eval or set reproduction_gate.trec_eval_executable"
-            )
-        candidate = Path(located).resolve()
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        raise ValueError(f"trec_eval executable is not an executable file: {candidate}")
-    return candidate
 
 
 def _require_nonempty_regular_file(path: Path, *, label: str) -> None:
@@ -2532,7 +2533,7 @@ def _probe_trec_eval(executable: Path) -> dict[str, Any]:
 
 
 def _evaluate_bm25(args: argparse.Namespace) -> int:
-    config = _load_retrieval_config(args.config)
+    config = _apply_trec_eval_cli_override(_load_retrieval_config(args.config), args)
     environment = _require_external_environment(config)
     output = _audit_path(config, "reproduction")
     _ensure_writable_targets([output], overwrite=args.overwrite)
@@ -2547,7 +2548,7 @@ def _evaluate_bm25(args: argparse.Namespace) -> int:
     source_run_sha256 = _sha256(dev_run_path)
     source_run_size_bytes = dev_run_path.stat().st_size
 
-    # The official tool evaluates the untouched 1,000-hit dev run first.
+    # Сначала официальный инструмент оценивает неизменённую выдачу top-1000 dev.
     ndcg_execution = _run_trec_eval_binary(
         executable,
         [
@@ -2711,7 +2712,7 @@ def _audit_qrels(args: argparse.Namespace) -> int:
         "annotations_revision": config["dataset"]["annotations_revision"],
         "splits": split_reports,
         "max_judged_negatives_recommendation": None,
-        "note": "No training-sampling decision is made in Phase 1A.",
+        "note": "Этап 1A не принимает решений о формировании обучающей выборки.",
     }
     _write_json(output, payload)
     _print_json(payload)
@@ -3001,9 +3002,8 @@ def _package_phase1(args: argparse.Namespace) -> int:
         "archive": archive_path.exists(),
         "manifest": manifest_path.exists(),
     }
-    # A freshly cloned repository ships a placeholder manifest and no ZIP, so a
-    # missing ZIP beside an existing manifest is the normal first-run state.
-    # It is only reported as partial when the caller refused to overwrite.
+    # В свежем клоне есть заготовка манифеста, но нет ZIP: это нормальное состояние
+    # первого запуска. Частичным оно считается лишь при запрете перезаписи.
     if (
         any(existing_package.values())
         and not all(existing_package.values())
@@ -3748,7 +3748,9 @@ def _rerank_evaluation_preflight(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _evaluate_rerank_impl(args: argparse.Namespace) -> int:
-    config = rerank_module.load_rerank_config(args.config)
+    config = _apply_trec_eval_cli_override(
+        rerank_module.load_rerank_config(args.config), args
+    )
     if args.split != "dev":
         raise ValueError("Phase 2 evaluation only supports dev")
     try:
@@ -4257,14 +4259,18 @@ def _evaluate_rerank(args: argparse.Namespace) -> int:
 
 
 def _package_phase2(args: argparse.Namespace) -> int:
-    config = rerank_module.load_rerank_config(args.config)
+    config = _apply_trec_eval_cli_override(
+        rerank_module.load_rerank_config(args.config), args
+    )
     report = rerank_module.package_phase2(config, overwrite=bool(args.overwrite))
     _print_json(report)
     return 0
 
 
 def _load_phase3_config(args: argparse.Namespace) -> dict[str, Any]:
-    return training_data_module.load_finetune_config(args.config)
+    return _apply_trec_eval_cli_override(
+        training_data_module.load_finetune_config(args.config), args
+    )
 
 
 def _build_training_split_phase3(args: argparse.Namespace) -> int:
@@ -4350,18 +4356,72 @@ def _package_phase3(args: argparse.Namespace) -> int:
     return 0
 
 
+class _RussianArgumentParser(argparse.ArgumentParser):
+    """Русские служебные подписи без изменения имён команд и параметров."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._positionals.title = "позиционные аргументы"
+        self._optionals.title = "параметры"
+        for action in self._actions:
+            if action.dest == "help":
+                action.help = "показать эту справку и выйти"
+
+    @staticmethod
+    def _translated_error(message: str) -> str:
+        if message == "the following arguments are required: command":
+            return "не указана обязательная команда"
+        match = re.fullmatch(r"the following arguments are required: (.+)", message)
+        if match:
+            return f"не указаны обязательные параметры: {match.group(1)}"
+        match = re.fullmatch(
+            r"argument ([^:]+): invalid choice: (.+) \(choose from (.+)\)", message
+        )
+        if match:
+            name, value, choices = match.groups()
+            label = "команда" if name == "command" else f"параметр {name}"
+            return f"{label}: недопустимое значение {value}; допустимые значения: {choices}"
+        match = re.fullmatch(r"argument ([^:]+): invalid int value: (.+)", message)
+        if match:
+            return (
+                f"параметр {match.group(1)}: ожидалось целое число, "
+                f"получено {match.group(2)}"
+            )
+        match = re.fullmatch(r"argument ([^:]+): expected one argument", message)
+        if match:
+            return f"для параметра {match.group(1)} требуется значение"
+        match = re.fullmatch(r"unrecognized arguments: (.+)", message)
+        if match:
+            return f"неизвестные параметры: {match.group(1)}"
+        match = re.fullmatch(
+            r"argument ([^:]+): not allowed with argument (.+)", message
+        )
+        if match:
+            return (
+                f"параметры {match.group(1)} и {match.group(2)} нельзя использовать вместе"
+            )
+        match = re.fullmatch(r"one of the arguments (.+) is required", message)
+        if match:
+            return f"требуется один из параметров: {match.group(1)}"
+        return "некорректные параметры командной строки; используйте --help"
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: ошибка: {self._translated_error(message)}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _RussianArgumentParser(
         prog="python -m rusearchrank.cli",
         description=(
-            "RuSearchRank Phase 0 checks, guarded Phase 1 retrieval, and "
-            "Phase 2 zero-shot reranking plus isolated Phase 3 fine-tuning"
+            "RuSearchRank: проверки, BM25, zero-shot reranking и изолированный "
+            "fine-tuning этапа 3"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     data_parser = subparsers.add_parser(
-        "inspect-data", help="inspect small official MIRACL Russian samples"
+        "inspect-data", help="проверить небольшие официальные примеры MIRACL-RU"
     )
     data_parser.add_argument("--sample-size", type=int, default=3)
     data_parser.add_argument("--timeout", type=float, default=30.0)
@@ -4372,7 +4432,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     annotations_parser = subparsers.add_parser(
         "prepare-annotations",
-        help="download and validate revision-pinned MIRACL topics and qrels",
+        help="скачать и проверить topics и qrels из зафиксированной ревизии MIRACL",
     )
     annotations_parser.add_argument(
         "--config", default=str(DEFAULT_RETRIEVAL_CONFIG)
@@ -4381,12 +4441,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--split",
         choices=("all", "train"),
         default="all",
-        help="materialize all annotations or exactly one split",
+        help="подготовить всю разметку или только указанную часть",
     )
     annotations_parser.set_defaults(func=_prepare_annotations)
 
     checkpoint_parser = subparsers.add_parser(
-        "inspect-checkpoint", help="inspect tokenizer/config and optionally run model inference"
+        "inspect-checkpoint",
+        help="проверить токенизатор и конфигурацию, при необходимости применить модель",
     )
     checkpoint_parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     checkpoint_parser.add_argument("--revision", default="main")
@@ -4394,7 +4455,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_parser.add_argument(
         "--with-model",
         action="store_true",
-        help="download model weights and run CPU/MPS inference",
+        help="скачать веса и применить модель на CPU или MPS",
     )
     checkpoint_parser.add_argument(
         "--output", default=str(DEFAULT_AUDIT_DIR / "checkpoint_contract.json")
@@ -4402,7 +4463,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_parser.set_defaults(func=_inspect_checkpoint)
 
     validation_parser = subparsers.add_parser(
-        "validate-candidates", help="validate a CSV, TSV, or Parquet candidate table"
+        "validate-candidates", help="проверить таблицу кандидатов CSV, TSV или Parquet"
     )
     validation_parser.add_argument("path")
     validation_parser.add_argument(
@@ -4411,7 +4472,8 @@ def build_parser() -> argparse.ArgumentParser:
     validation_parser.set_defaults(func=_validate_candidates)
 
     environment_parser = subparsers.add_parser(
-        "environment-report", help="capture Python, Java, platform, disk, and MPS facts"
+        "environment-report",
+        help="записать сведения о Python, Java, платформе, диске и MPS",
     )
     environment_parser.add_argument(
         "--output", default=str(DEFAULT_AUDIT_DIR / "environment.json")
@@ -4420,19 +4482,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     linux_parser = subparsers.add_parser(
         "inspect-linux-environment",
-        help="validate the exact external retrieval environment",
+        help="проверить точное внешнее окружение первого этапа поиска",
     )
     linux_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     linux_parser.add_argument(
         "--check-index",
         action="store_true",
-        help="download/open the official index and run one smoke query",
+        help="открыть официальный индекс и выполнить один пробный запрос",
     )
     linux_parser.set_defaults(func=_inspect_linux_environment)
 
     preflight_parser = subparsers.add_parser(
         "preflight",
-        help="validate the environment and all inputs before a heavy Phase 1 stage",
+        help="проверить окружение и входы перед ресурсоёмкой стадией этапа 1",
     )
     preflight_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     preflight_parser.add_argument(
@@ -4443,12 +4505,12 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument(
         "--check-index",
         action="store_true",
-        help="open/download and smoke-test the official prebuilt index",
+        help="открыть или скачать официальный индекс и выполнить первичную проверку",
     )
     preflight_parser.set_defaults(func=_preflight_command)
 
     bm25_parser = subparsers.add_parser(
-        "run-bm25", help="run guarded full Pyserini BM25 retrieval"
+        "run-bm25", help="выполнить полный BM25-поиск Pyserini с проверками"
     )
     bm25_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     bm25_parser.add_argument(
@@ -4460,27 +4522,27 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_parser = subparsers.add_parser(
         "smoke-corpus-access",
         help=(
-            "real cheap corpus/Parquet/ZIP round trip against the pinned "
-            "revision; required before the full candidate cache"
+            "выполнить короткую проверку корпуса, Parquet и ZIP на "
+            "зафиксированной ревизии перед построением всех кандидатов"
         ),
     )
     smoke_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     smoke_parser.add_argument(
-        "--shard-index", type=int, default=0, help="which official shard to sample"
+        "--shard-index", type=int, default=0, help="номер проверяемого официального сегмента"
     )
     smoke_parser.add_argument(
-        "--max-rows", type=int, default=2000, help="rows parsed from the shard"
+        "--max-rows", type=int, default=2000, help="максимум строк из сегмента"
     )
     smoke_parser.add_argument(
         "--min-passages",
         type=int,
         default=25,
-        help="minimum real passages the smoke must filter and materialize",
+        help="минимум настоящих документов для первичной проверки",
     )
     smoke_parser.add_argument(
         "--shards-dir",
         default=None,
-        help="use already-materialized local shards instead of the Hub",
+        help="использовать локальные сегменты вместо Hugging Face Hub",
     )
     smoke_parser.add_argument(
         "--output", default=str(DEFAULT_AUDIT_DIR / "corpus_smoke.json")
@@ -4489,28 +4551,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     cache_parser = subparsers.add_parser(
         "build-candidate-cache",
-        help="join qrels and stream only top-100 candidate passages",
+        help="соединить qrels и потоково сохранить только документы top-100",
     )
     cache_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     cache_parser.add_argument("--overwrite", action="store_true")
     cache_parser.set_defaults(func=_build_candidate_cache)
 
     evaluate_parser = subparsers.add_parser(
-        "evaluate-bm25", help="compare internal metrics with official Pyserini evaluation"
+        "evaluate-bm25", help="сопоставить внутренние метрики с официальным оцениванием"
     )
     evaluate_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     evaluate_parser.add_argument("--overwrite", action="store_true")
     evaluate_parser.set_defaults(func=_evaluate_bm25)
 
     audit_parser = subparsers.add_parser(
-        "audit-qrels", help="write qrels and candidate-coverage audit"
+        "audit-qrels", help="записать проверку qrels и покрытия кандидатами"
     )
     audit_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     audit_parser.add_argument("--overwrite", action="store_true")
     audit_parser.set_defaults(func=_audit_qrels)
 
     package_parser = subparsers.add_parser(
-        "package-phase1", help="validate and package only portable Phase 1 results"
+        "package-phase1", help="проверить и упаковать переносимые результаты этапа 1"
     )
     package_parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     package_parser.add_argument("--overwrite", action="store_true")
@@ -4518,7 +4580,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rerank_smoke_parser = subparsers.add_parser(
         "smoke-rerank",
-        help="run a real pinned-model forward and temporary Phase 2 round trip",
+        help="выполнить настоящий проход модели и временный цикл этапа 2",
     )
     rerank_smoke_parser.add_argument(
         "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
@@ -4534,7 +4596,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rerank_score_parser = subparsers.add_parser(
         "rerank-score",
-        help="score dev BM25 candidates with guarded sharding and resume",
+        help="рассчитать оценки dev-кандидатов с сегментами и продолжением",
     )
     rerank_score_parser.add_argument(
         "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
@@ -4547,14 +4609,14 @@ def build_parser() -> argparse.ArgumentParser:
     rerank_score_parser.add_argument(
         "--checkpoint",
         default=None,
-        help="Optional local fine-tuned checkpoint directory.",
+        help="необязательный локальный каталог контрольной точки после fine-tuning",
     )
     rerank_score_parser.add_argument("--overwrite", action="store_true")
     rerank_score_parser.set_defaults(func=_rerank_score)
 
     rerank_run_parser = subparsers.add_parser(
         "build-rerank-run",
-        help="build a rank-preserving TREC run from raw float32 scores",
+        help="построить TREC-файл с сохранением порядка по исходным float32-оценкам",
     )
     rerank_run_parser.add_argument(
         "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
@@ -4568,7 +4630,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rerank_evaluate_parser = subparsers.add_parser(
         "evaluate-rerank",
-        help="run official NIST evaluation and Phase 2 diagnostics",
+        help="выполнить официальное оценивание NIST и диагностику этапа 2",
     )
     rerank_evaluate_parser.add_argument(
         "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
@@ -4581,7 +4643,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase2_package_parser = subparsers.add_parser(
         "package-phase2",
-        help="snapshot, manifest, package, and revalidate Phase 2 results",
+        help="зафиксировать, описать, упаковать и повторно проверить результаты этапа 2",
     )
     phase2_package_parser.add_argument(
         "--config", default=str(rerank_module.DEFAULT_RERANK_CONFIG)
@@ -4591,7 +4653,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_split_parser = subparsers.add_parser(
         "build-training-split",
-        help="materialize the isolated train-fit/train-validation query split",
+        help="построить изолированное разделение train_fit/train_validation",
     )
     phase3_split_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4601,7 +4663,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_pairs_parser = subparsers.add_parser(
         "build-training-pairs",
-        help="materialize one preregistered Phase 3 pair regime",
+        help="построить один заранее заданный режим обучающих пар",
     )
     phase3_pairs_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4614,7 +4676,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_checkpoint_parser = subparsers.add_parser(
         "validate-checkpoint",
-        help="evaluate S0 or a local checkpoint on train validation groups",
+        help="оценить S0 или локальную контрольную точку на контрольной выборке",
     )
     phase3_checkpoint_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4624,7 +4686,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_smoke_parser = subparsers.add_parser(
         "smoke-finetune",
-        help="run the real-model two-step Phase 3 CUDA smoke gate",
+        help="выполнить четырёхшаговую первичную CUDA-проверку настоящей модели",
     )
     phase3_smoke_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4633,7 +4695,7 @@ def build_parser() -> argparse.ArgumentParser:
     phase3_smoke_parser.set_defaults(func=_smoke_finetune_phase3)
 
     phase3_train_parser = subparsers.add_parser(
-        "finetune", help="run a registered CUDA fine-tuning experiment"
+        "finetune", help="выполнить зарегистрированный CUDA-запуск fine-tuning"
     )
     phase3_train_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4647,7 +4709,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_select_parser = subparsers.add_parser(
         "select-checkpoint",
-        help="select and atomically publish the validation winner before dev access",
+        help="выбрать и атомарно опубликовать победителя до доступа к dev",
     )
     phase3_select_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4657,7 +4719,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_prepare_parser = subparsers.add_parser(
         "prepare-dev-evaluation",
-        help="append the ledger and materialize guarded evaluation qrels",
+        help="добавить событие журнала и подготовить защищённые dev qrels",
     )
     phase3_prepare_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4666,7 +4728,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_score_parser = subparsers.add_parser(
         "score-finetuned",
-        help="score exactly the published best_finetuned checkpoint",
+        help="рассчитать оценки ровно для опубликованной точки best_finetuned",
     )
     phase3_score_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4676,7 +4738,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_evaluate_parser = subparsers.add_parser(
         "evaluate-phase3",
-        help="run final BM25/zero-shot/fine-tuned comparison and diagnostics",
+        help="сравнить BM25, zero-shot и модель после fine-tuning",
     )
     phase3_evaluate_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
@@ -4686,13 +4748,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     phase3_package_parser = subparsers.add_parser(
         "package-phase3",
-        help="build and revalidate the exact Phase 3 result and model archives",
+        help="создать и повторно проверить архивы результатов и модели этапа 3",
     )
     phase3_package_parser.add_argument(
         "--config", default=str(training_data_module.DEFAULT_FINETUNE_CONFIG)
     )
     phase3_package_parser.add_argument("--overwrite", action="store_true")
     phase3_package_parser.set_defaults(func=_package_phase3)
+    for command_parser in (
+        preflight_parser,
+        evaluate_parser,
+        rerank_evaluate_parser,
+        phase2_package_parser,
+        phase3_checkpoint_parser,
+        phase3_smoke_parser,
+        phase3_train_parser,
+        phase3_select_parser,
+        phase3_prepare_parser,
+        phase3_score_parser,
+        phase3_evaluate_parser,
+        phase3_package_parser,
+    ):
+        command_parser.add_argument(
+            "--trec-eval-path",
+            default=None,
+            help=(
+                "путь к trec_eval; имеет приоритет над настройкой, "
+                "TREC_EVAL_PATH и PATH"
+            ),
+        )
     return parser
 
 
@@ -4702,10 +4786,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except StageError as exc:
-        print(f"error: stage {exc.stage} failed\n{exc}", file=sys.stderr)
+        print(f"ошибка: стадия {exc.stage} завершилась неуспешно\n{exc}", file=sys.stderr)
         return 1
     except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc:
-        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"ошибка: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 
