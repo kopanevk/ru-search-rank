@@ -57,6 +57,21 @@ Phase 2 и Phase 3 — два варианта второго этапа пои�
 
 ---
 
+## Технологии
+
+| Область | Инструменты |
+|---|---|
+| Поиск и ранжирование | BM25, cross-encoder, `trec_eval` |
+| Машинное обучение | PyTorch, Transformers |
+| Обработка данных | Python, pandas, NumPy, Parquet |
+| Эксперименты | Jupyter, Kaggle GPU, YAML-конфигурации |
+| Проверка качества | pytest, paired bootstrap, SHA-256 |
+| Разработка | Git, GitHub Actions |
+
+**Основной стек:** Python 3.12, PyTorch, Transformers, pandas, NumPy, Jupyter, Kaggle GPU, `trec_eval`, pytest и GitHub Actions.
+
+---
+
 ## Ключевые результаты
 
 | Этап | Система | nDCG@10 | MRR@10 | Recall@100 |
